@@ -1,5 +1,6 @@
 export const API_ERROR_CODES = {
     BACKEND_UNAVAILABLE: "backend_unavailable",
+    BROADCAST_ALREADY_ACTIVE: "broadcast_already_active",
     CREATE_SESSION_FAILED: "create_session_failed",
     INCORRECT_PASSWORD: "incorrect_password",
     INVALID_LOCALE: "invalid_locale",
@@ -7,6 +8,7 @@ export const API_ERROR_CODES = {
     INVALID_SESSION_DURATION: "invalid_session_duration",
     LANGUAGE_NOT_ALLOWED: "language_not_allowed",
     LIVEKIT_NOT_CONFIGURED: "livekit_not_configured",
+    ORGANIZER_ACCESS_REQUIRED: "organizer_access_required",
     SESSION_INACTIVE: "session_inactive",
     SESSION_NOT_FOUND: "session_not_found",
     TRANSLATION_OUTPUTS_DISABLED: "translation_outputs_disabled",

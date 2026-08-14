@@ -35,8 +35,19 @@ export class SessionsController {
         return this.api.getSession(sessionId);
     }
 
+    @Get(":sessionId/presenter")
+    getPresenterStatus(@Param("sessionId") sessionId: string) {
+        return this.api.getPresenterStatus(sessionId);
+    }
+
+    @Post(":sessionId/presenter")
+    @HttpCode(200)
+    claimPresenter(@Param("sessionId") sessionId: string, @Body() body: unknown) {
+        return this.api.claimPresenter(sessionId, body);
+    }
+
     @Delete(":sessionId")
-    deleteSession(@Param("sessionId") sessionId: string) {
-        return this.api.deleteSession(sessionId);
+    deleteSession(@Param("sessionId") sessionId: string, @Body() body: unknown) {
+        return this.api.deleteSession(sessionId, body);
     }
 }

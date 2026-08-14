@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 
 import { HttpException, Injectable, type OnApplicationShutdown } from "@nestjs/common";
 import { AccessToken } from "livekit-server-sdk";
@@ -8,6 +8,8 @@ import type { Locale } from "./i18n/locales";
 import { API_ERROR_CODES, apiError } from "./lib/api-errors";
 import {
     createSessionRequestSchema,
+    deleteSessionRequestSchema,
+    presenterLeaseRequestSchema,
     tokenQuerySchema,
     translateStatusQuerySchema,
     translationRequestSchema,
@@ -18,7 +20,10 @@ import { createLogger } from "./lib/logger";
 import { getConfiguredAttendeeOrigin } from "./lib/public-origin";
 import { getBroadcastPassword, getLiveKitCredentials, getLiveKitUrl } from "./lib/server-env";
 import { MAX_SESSION_DURATION_MINUTES, MIN_SESSION_DURATION_MINUTES } from "./lib/session-duration";
-import TranslationSessionManager from "./lib/translation-session-manager";
+import TranslationSessionManager, {
+    hashOrganizerKey,
+    type SessionInfo,
+} from "./lib/translation-session-manager";
 
 export type RequestHeaders = Record<string, string | string[] | undefined>;
 export type RequestQuery = Record<string, string | string[] | undefined>;
@@ -75,6 +80,23 @@ function toQueryObject(query: RequestQuery): Record<string, string> {
 
 function shortSessionId() {
     return randomUUID().slice(0, 8);
+}
+
+function createOrganizerKey() {
+    return randomBytes(32).toString("base64url");
+}
+
+function toPublicSession(session: SessionInfo) {
+    return {
+        allowedLanguages: session.allowedLanguages,
+        createdAt: session.createdAt,
+        durationMinutes: session.durationMinutes,
+        enableAudioTranslation: session.enableAudioTranslation,
+        enableTranscription: session.enableTranscription,
+        expiresAt: session.expiresAt,
+        organizerIdentity: session.organizerIdentity,
+        sessionId: session.sessionId,
+    };
 }
 
 function throwApiError(
@@ -182,6 +204,7 @@ export class TranslationApiService implements OnApplicationShutdown {
             }
 
             const organizerIdentity = `organizer-${organizerName}`;
+            const organizerKey = createOrganizerKey();
 
             if (this.manager.hasSession(sessionId)) {
                 log.info(
@@ -194,6 +217,7 @@ export class TranslationApiService implements OnApplicationShutdown {
             this.manager.createSession(sessionId, organizerIdentity, {
                 enableAudioTranslation,
                 enableTranscription,
+                organizerKeyHash: hashOrganizerKey(organizerKey),
                 durationMinutes,
                 ...(allowedLanguages ? { allowedLanguages } : {}),
             });
@@ -206,6 +230,7 @@ export class TranslationApiService implements OnApplicationShutdown {
             return {
                 sessionId,
                 organizerIdentity,
+                organizerKey,
                 locale,
                 enableAudioTranslation,
                 enableTranscription,
@@ -233,7 +258,7 @@ export class TranslationApiService implements OnApplicationShutdown {
     }
 
     getSessions() {
-        return { sessions: this.manager.getAllSessions() };
+        return { sessions: this.manager.getAllSessions().map(toPublicSession) };
     }
 
     getSession(sessionId: string) {
@@ -246,12 +271,93 @@ export class TranslationApiService implements OnApplicationShutdown {
         const translations = this.manager.getActiveTranslations(sessionId);
 
         return {
-            ...session,
+            ...toPublicSession(session),
             translations,
         };
     }
 
-    async deleteSession(sessionId: string) {
+    getPresenterStatus(sessionId: string) {
+        const status = this.manager.getPresenterStatus(sessionId);
+
+        if (!status) {
+            return throwApiError(404, API_ERROR_CODES.SESSION_NOT_FOUND, "Session not found");
+        }
+
+        return {
+            active: status.active,
+            ...(status.leaseExpiresAt
+                ? { leaseExpiresAt: status.leaseExpiresAt.toISOString() }
+                : {}),
+        };
+    }
+
+    claimPresenter(sessionId: string, body: unknown) {
+        const parsed = presenterLeaseRequestSchema.safeParse(body ?? {});
+        if (!parsed.success) {
+            return throwApiError(
+                400,
+                API_ERROR_CODES.INVALID_REQUEST,
+                "Missing organizer key or presenter client id",
+                zodErrorDetails(parsed.error),
+            );
+        }
+
+        const { clientId, organizerKey, takeover } = parsed.data;
+        const claim = this.manager.claimPresenter(sessionId, organizerKey, clientId, {
+            takeover: takeover === true,
+        });
+
+        if (claim.status === "session_missing") {
+            return throwApiError(404, API_ERROR_CODES.SESSION_NOT_FOUND, "Session not found");
+        }
+
+        if (claim.status === "invalid_key") {
+            return throwApiError(
+                401,
+                API_ERROR_CODES.ORGANIZER_ACCESS_REQUIRED,
+                "Organizer access required",
+            );
+        }
+
+        if (claim.status === "already_active") {
+            return throwApiError(
+                409,
+                API_ERROR_CODES.BROADCAST_ALREADY_ACTIVE,
+                "Broadcast controls are already active elsewhere",
+                { leaseExpiresAt: claim.leaseExpiresAt.toISOString() },
+            );
+        }
+
+        return {
+            active: true,
+            leaseExpiresAt: claim.leaseExpiresAt.toISOString(),
+        };
+    }
+
+    async deleteSession(sessionId: string, body: unknown) {
+        const parsed = deleteSessionRequestSchema.safeParse(body ?? {});
+        if (!parsed.success) {
+            return throwApiError(
+                401,
+                API_ERROR_CODES.ORGANIZER_ACCESS_REQUIRED,
+                "Organizer access required",
+                zodErrorDetails(parsed.error),
+            );
+        }
+
+        const session = this.manager.getSession(sessionId);
+        if (!session) {
+            return throwApiError(404, API_ERROR_CODES.SESSION_NOT_FOUND, "Session not found");
+        }
+
+        if (!this.manager.isOrganizerKeyValid(sessionId, parsed.data.organizerKey)) {
+            return throwApiError(
+                401,
+                API_ERROR_CODES.ORGANIZER_ACCESS_REQUIRED,
+                "Organizer access required",
+            );
+        }
+
         await this.manager.removeAllTranslations(sessionId);
         return { success: true };
     }
@@ -267,13 +373,8 @@ export class TranslationApiService implements OnApplicationShutdown {
             );
         }
 
-        const { identity, password, role, room } = parsed.data;
+        const { identity, organizerKey, presenterClientId, role, room } = parsed.data;
         const isOrganizer = role === "organizer";
-
-        const expectedPassword = getBroadcastPassword();
-        if (isOrganizer && expectedPassword && password !== expectedPassword) {
-            return throwApiError(401, API_ERROR_CODES.INCORRECT_PASSWORD, "Incorrect password");
-        }
 
         const session = this.manager.getSession(room);
         log.info({ found: !!session, room }, "Checking session for token request");
@@ -283,6 +384,32 @@ export class TranslationApiService implements OnApplicationShutdown {
                 API_ERROR_CODES.SESSION_INACTIVE,
                 "Broadcast session has not started yet or has ended",
             );
+        }
+
+        if (isOrganizer) {
+            if (
+                !organizerKey ||
+                !presenterClientId ||
+                !this.manager.isOrganizerKeyValid(room, organizerKey)
+            ) {
+                return throwApiError(
+                    401,
+                    API_ERROR_CODES.ORGANIZER_ACCESS_REQUIRED,
+                    "Organizer access required",
+                );
+            }
+
+            if (!this.manager.hasActivePresenterLease(room, organizerKey, presenterClientId)) {
+                const status = this.manager.getPresenterStatus(room);
+                return throwApiError(
+                    409,
+                    API_ERROR_CODES.BROADCAST_ALREADY_ACTIVE,
+                    "Broadcast controls are already active elsewhere",
+                    status?.leaseExpiresAt
+                        ? { leaseExpiresAt: status.leaseExpiresAt.toISOString() }
+                        : undefined,
+                );
+            }
         }
 
         const credentials = getLiveKitCredentials();
@@ -299,8 +426,8 @@ export class TranslationApiService implements OnApplicationShutdown {
             Math.ceil((session.expiresAt.getTime() - Date.now()) / 1000),
         );
         const at = new AccessToken(credentials.apiKey, credentials.apiSecret, {
-            identity,
-            name: identity,
+            identity: isOrganizer ? session.organizerIdentity : identity,
+            name: isOrganizer ? session.organizerIdentity : identity,
             ttl: remainingSeconds,
         });
 

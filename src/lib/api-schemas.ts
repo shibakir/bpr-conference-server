@@ -51,6 +51,7 @@ export type CreateSessionRequest = z.infer<typeof createSessionRequestSchema>;
 
 export const createSessionResponseSchema = z
     .object({
+        organizerKey: z.string().optional(),
         sessionId: z.string(),
     })
     .passthrough();
@@ -82,7 +83,9 @@ export const authStatusResponseSchema = z.object({
 
 export const tokenQuerySchema = z.object({
     identity: z.string().min(1),
+    organizerKey: z.string().optional(),
     password: z.string().optional(),
+    presenterClientId: z.string().optional(),
     role: z.enum(["attendee", "organizer"]).optional().default("attendee"),
     room: z.string().min(1),
 });
@@ -127,6 +130,21 @@ export const translationStartResponseSchema = z
 
 export const translateStatusQuerySchema = z.object({
     sessionId: z.string().min(1),
+});
+
+export const presenterLeaseRequestSchema = z.object({
+    clientId: z.string().min(1),
+    organizerKey: z.string().min(1),
+    takeover: z.boolean().optional(),
+});
+
+export const presenterStatusResponseSchema = z.object({
+    active: z.boolean(),
+    leaseExpiresAt: z.string().optional(),
+});
+
+export const deleteSessionRequestSchema = z.object({
+    organizerKey: z.string().min(1),
 });
 
 export function zodErrorDetails(error: z.ZodError): Record<string, unknown> {

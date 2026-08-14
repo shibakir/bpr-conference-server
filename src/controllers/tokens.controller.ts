@@ -1,4 +1,4 @@
-import { Controller, Get, Inject, Query } from "@nestjs/common";
+import { Body, Controller, Get, HttpCode, Inject, Post, Query } from "@nestjs/common";
 
 import { type RequestQuery, TranslationApiService } from "../translation-api.service";
 
@@ -12,5 +12,11 @@ export class TokensController {
     @Get()
     getToken(@Query() query: RequestQuery) {
         return this.api.getToken(query);
+    }
+
+    @Post()
+    @HttpCode(200)
+    createToken(@Body() body: unknown) {
+        return this.api.getToken(body as RequestQuery);
     }
 }

@@ -7,6 +7,8 @@
  *   const bridge = await manager.getOrCreate(sessionId, targetLanguage, organizerIdentity);
  */
 
+import { createHash, timingSafeEqual } from "node:crypto";
+
 import { type ParticipantInfo, RoomServiceClient } from "livekit-server-sdk";
 
 import { createLogger } from "./logger";
@@ -30,19 +32,59 @@ export interface TranslationInfo {
 export interface SessionInfo {
     sessionId: string;
     organizerIdentity: string;
+    organizerKeyHash: string;
     createdAt: Date;
     durationMinutes: number;
     expiresAt: Date;
     enableAudioTranslation: boolean;
     enableTranscription: boolean;
     allowedLanguages?: string[];
+    presenterClientId?: string;
+    presenterLeaseExpiresAt?: Date;
 }
+
+export type PresenterStatus = {
+    active: boolean;
+    leaseExpiresAt?: Date;
+};
+
+export type PresenterClaimResult =
+    | {
+          status: "claimed";
+          leaseExpiresAt: Date;
+      }
+    | {
+          status: "already_active";
+          leaseExpiresAt: Date;
+      }
+    | {
+          status: "invalid_key";
+      }
+    | {
+          status: "session_missing";
+      };
 
 const globalForSessionManager = global as unknown as {
     sessionManagerInstance: TranslationSessionManager;
 };
 
 const log = createLogger({ component: "translation-session-manager" });
+const PRESENTER_LEASE_MS = 15_000;
+
+export function hashOrganizerKey(organizerKey: string): string {
+    return createHash("sha256").update(organizerKey).digest("hex");
+}
+
+function secureCompareHex(a: string, b: string): boolean {
+    const left = Buffer.from(a, "hex");
+    const right = Buffer.from(b, "hex");
+
+    if (left.length !== right.length) {
+        return false;
+    }
+
+    return timingSafeEqual(left, right);
+}
 
 function getLiveKitApiUrl(): string {
     const configuredUrl = getLiveKitUrl();
@@ -99,6 +141,7 @@ class TranslationSessionManager {
         options: {
             enableAudioTranslation: boolean;
             enableTranscription: boolean;
+            organizerKeyHash: string;
             allowedLanguages?: string[];
             durationMinutes?: number;
         },
@@ -108,6 +151,7 @@ class TranslationSessionManager {
         const info: SessionInfo = {
             sessionId,
             organizerIdentity,
+            organizerKeyHash: options.organizerKeyHash,
             createdAt,
             durationMinutes,
             expiresAt: new Date(createdAt.getTime() + durationMinutes * 60_000),
@@ -131,6 +175,81 @@ class TranslationSessionManager {
         return info;
     }
 
+    getPresenterStatus(sessionId: string): PresenterStatus | undefined {
+        const session = this.getSession(sessionId);
+        if (!session) return undefined;
+
+        const activeLease = this.getActivePresenterLease(session);
+        if (!activeLease) {
+            delete session.presenterClientId;
+            delete session.presenterLeaseExpiresAt;
+            return { active: false };
+        }
+
+        return {
+            active: true,
+            leaseExpiresAt: activeLease.leaseExpiresAt,
+        };
+    }
+
+    claimPresenter(
+        sessionId: string,
+        organizerKey: string,
+        clientId: string,
+        options: { takeover?: boolean } = {},
+    ): PresenterClaimResult {
+        const session = this.getSession(sessionId);
+        if (!session) {
+            return { status: "session_missing" };
+        }
+
+        if (!this.isOrganizerKeyValidForSession(session, organizerKey)) {
+            return { status: "invalid_key" };
+        }
+
+        const activeLease = this.getActivePresenterLease(session);
+        if (activeLease && activeLease.clientId !== clientId && options.takeover !== true) {
+            return {
+                status: "already_active",
+                leaseExpiresAt: activeLease.leaseExpiresAt,
+            };
+        }
+
+        const leaseExpiresAt = new Date(Date.now() + PRESENTER_LEASE_MS);
+        session.presenterClientId = clientId;
+        session.presenterLeaseExpiresAt = leaseExpiresAt;
+
+        log.info(
+            {
+                clientId,
+                leaseExpiresAt,
+                sessionId,
+                takeover: options.takeover === true,
+            },
+            "Claimed presenter lease",
+        );
+
+        return {
+            status: "claimed",
+            leaseExpiresAt,
+        };
+    }
+
+    hasActivePresenterLease(sessionId: string, organizerKey: string, clientId: string): boolean {
+        const session = this.getSession(sessionId);
+        if (!session || !this.isOrganizerKeyValidForSession(session, organizerKey)) {
+            return false;
+        }
+
+        const activeLease = this.getActivePresenterLease(session);
+        return activeLease?.clientId === clientId;
+    }
+
+    isOrganizerKeyValid(sessionId: string, organizerKey: string): boolean {
+        const session = this.getSession(sessionId);
+        return session ? this.isOrganizerKeyValidForSession(session, organizerKey) : false;
+    }
+
     getSession(sessionId: string): SessionInfo | undefined {
         const session = this.sessions.get(sessionId);
         if (!session) return undefined;
@@ -145,6 +264,25 @@ class TranslationSessionManager {
 
     hasSession(sessionId: string): boolean {
         return this.sessions.has(sessionId) || this.translations.has(sessionId);
+    }
+
+    private getActivePresenterLease(
+        session: SessionInfo,
+    ): { clientId: string; leaseExpiresAt: Date } | undefined {
+        const clientId = session.presenterClientId;
+        const leaseExpiresAt = session.presenterLeaseExpiresAt;
+        if (!clientId || !leaseExpiresAt) return undefined;
+
+        if (leaseExpiresAt.getTime() <= Date.now()) {
+            return undefined;
+        }
+
+        return { clientId, leaseExpiresAt };
+    }
+
+    private isOrganizerKeyValidForSession(session: SessionInfo, organizerKey: string): boolean {
+        const keyHash = hashOrganizerKey(organizerKey);
+        return secureCompareHex(session.organizerKeyHash, keyHash);
     }
 
     // Translation management
