@@ -274,18 +274,6 @@ export class TranslationBridge {
             this.status = "closed";
         });
 
-        this.room.on(RoomEvent.ParticipantDisconnected, (participant: RemoteParticipant) => {
-            if (participant.identity === this.organizerIdentity) {
-                this.log.info(
-                    { organizerIdentity: this.organizerIdentity },
-                    "Organizer disconnected; stopping bridge",
-                );
-                this.stop().catch((err) => {
-                    this.log.error({ err }, "Error stopping bridge after organizer disconnect");
-                });
-            }
-        });
-
         await this.room.connect(this.livekitUrl, token, {
             autoSubscribe: false,
             dynacast: false,
@@ -470,47 +458,74 @@ export class TranslationBridge {
     private async subscribeToOrganizer(): Promise<void> {
         if (!this.room) return;
 
-        // Find the organizer participant and subscribe to their audio
-        const participants = this.room.remoteParticipants;
+        const subscribeToPreferredOrganizerAudio = (
+            participant: RemoteParticipant,
+            reason: string,
+        ) => {
+            if (participant.identity !== this.organizerIdentity) return;
 
-        for (const [, participant] of participants) {
-            if (participant.identity === this.organizerIdentity) {
-                this.subscribeToParticipantAudio(participant);
+            const preferredPublication = this.selectOrganizerAudioPublication(participant);
+
+            if (!preferredPublication) {
+                this.log.info(
+                    { organizerIdentity: this.organizerIdentity, reason },
+                    "Organizer has no audio tracks yet",
+                );
                 return;
             }
-        }
 
-        // If organizer hasn't joined yet, wait for them
-        this.log.info({ organizerIdentity: this.organizerIdentity }, "Waiting for organizer");
+            this.subscribeToOrganizerPublication(preferredPublication, reason);
+        };
 
-        // Listen for the organizer to publish their track
+        this.room.on(RoomEvent.ParticipantConnected, (participant: RemoteParticipant) => {
+            if (participant.identity !== this.organizerIdentity) return;
+
+            this.log.info(
+                { organizerIdentity: this.organizerIdentity },
+                "Organizer connected; checking audio publications",
+            );
+            subscribeToPreferredOrganizerAudio(participant, "organizer connected");
+        });
+
+        this.room.on(RoomEvent.ParticipantDisconnected, (participant: RemoteParticipant) => {
+            if (participant.identity !== this.organizerIdentity) return;
+
+            this.log.info(
+                { organizerIdentity: this.organizerIdentity },
+                "Organizer disconnected; keeping bridge active for control recovery",
+            );
+            this.activeOrganizerAudioPipelineId = null;
+        });
+
         this.room.on(
             RoomEvent.TrackPublished,
             (publication: RemoteTrackPublication, participant: RemoteParticipant) => {
                 if (
-                    participant.identity === this.organizerIdentity &&
-                    publication.kind === TrackKind.KIND_AUDIO
+                    participant.identity !== this.organizerIdentity ||
+                    publication.kind !== TrackKind.KIND_AUDIO
                 ) {
-                    const preferredPublication = this.selectOrganizerAudioPublication(participant);
-
-                    if (preferredPublication === publication) {
-                        publication.setSubscribed(true);
-                    } else {
-                        this.log.info(
-                            {
-                                preferredPublication: preferredPublication
-                                    ? this.getPublicationLabel(preferredPublication)
-                                    : "none",
-                                publication: this.getPublicationLabel(publication),
-                            },
-                            "Ignoring non-preferred organizer audio publication",
-                        );
-                    }
+                    return;
                 }
+
+                const preferredPublication = this.selectOrganizerAudioPublication(participant);
+
+                if (preferredPublication === publication) {
+                    this.subscribeToOrganizerPublication(publication, "organizer track published");
+                    return;
+                }
+
+                this.log.info(
+                    {
+                        preferredPublication: preferredPublication
+                            ? this.getPublicationLabel(preferredPublication)
+                            : "none",
+                        publication: this.getPublicationLabel(publication),
+                    },
+                    "Ignoring non-preferred organizer audio publication",
+                );
             },
         );
 
-        // Once subscribed, pipe to Gemini
         this.room.on(
             RoomEvent.TrackSubscribed,
             (
@@ -526,37 +541,78 @@ export class TranslationBridge {
                 }
             },
         );
-    }
 
-    /**
-     * Manually subscribe to a participant's audio track (needed when autoSubscribe is off).
-     */
-    private subscribeToParticipantAudio(participant: RemoteParticipant): void {
-        // Listen before setSubscribed() so the subscription event cannot race past us.
-        this.room!.on(
-            RoomEvent.TrackSubscribed,
-            (track: RemoteAudioTrack, pub: RemoteTrackPublication, p: RemoteParticipant) => {
-                if (p.identity === this.organizerIdentity && pub.kind === TrackKind.KIND_AUDIO) {
-                    this.pipeTrackToGemini(track, pub);
+        this.room.on(
+            RoomEvent.TrackUnsubscribed,
+            (
+                track: RemoteAudioTrack,
+                publication: RemoteTrackPublication,
+                participant: RemoteParticipant,
+            ) => {
+                void track;
+                if (
+                    participant.identity !== this.organizerIdentity ||
+                    publication.kind !== TrackKind.KIND_AUDIO
+                ) {
+                    return;
                 }
+
+                this.clearOrganizerAudioPipeline(publication, "organizer track unsubscribed");
+                subscribeToPreferredOrganizerAudio(participant, "organizer track unsubscribed");
             },
         );
 
-        const preferredPublication = this.selectOrganizerAudioPublication(participant);
+        this.room.on(
+            RoomEvent.TrackUnpublished,
+            (publication: RemoteTrackPublication, participant: RemoteParticipant) => {
+                if (
+                    participant.identity !== this.organizerIdentity ||
+                    publication.kind !== TrackKind.KIND_AUDIO
+                ) {
+                    return;
+                }
 
-        if (!preferredPublication) {
+                this.clearOrganizerAudioPipeline(publication, "organizer track unpublished");
+                subscribeToPreferredOrganizerAudio(participant, "organizer track unpublished");
+            },
+        );
+
+        const organizer = Array.from(this.room.remoteParticipants.values()).find(
+            (participant) => participant.identity === this.organizerIdentity,
+        );
+
+        if (organizer) {
+            subscribeToPreferredOrganizerAudio(organizer, "initial organizer lookup");
+            return;
+        }
+
+        this.log.info({ organizerIdentity: this.organizerIdentity }, "Waiting for organizer");
+    }
+
+    private subscribeToOrganizerPublication(
+        publication: RemoteTrackPublication,
+        reason: string,
+    ): void {
+        const track = publication.track;
+
+        if (track) {
+            this.pipeTrackToGemini(track as RemoteAudioTrack, publication);
+            return;
+        }
+
+        if (publication.subscribed) {
             this.log.info(
-                { organizerIdentity: this.organizerIdentity },
-                "Organizer has no audio tracks yet",
+                { publication: this.getPublicationLabel(publication), reason },
+                "Waiting for organizer audio subscription to complete",
             );
             return;
         }
 
         this.log.info(
-            { publication: this.getPublicationLabel(preferredPublication) },
+            { publication: this.getPublicationLabel(publication), reason },
             "Subscribing to organizer audio publication",
         );
-        preferredPublication.setSubscribed(true);
+        publication.setSubscribed(true);
     }
 
     private selectOrganizerAudioPublication(
@@ -642,11 +698,35 @@ export class TranslationBridge {
             });
     }
 
+    private clearOrganizerAudioPipeline(publication: RemoteTrackPublication, reason: string): void {
+        const publicationId = this.getPublicationId(publication);
+        if (
+            !this.activeOrganizerAudioPipelineId ||
+            this.activeOrganizerAudioPipelineId !== publicationId
+        ) {
+            return;
+        }
+
+        this.log.info(
+            {
+                pipelineId: this.activeOrganizerAudioPipelineId,
+                publication: this.getPublicationLabel(publication),
+                reason,
+            },
+            "Organizer audio pipeline ended",
+        );
+        this.activeOrganizerAudioPipelineId = null;
+    }
+
     private getAudioPipelineId(
         track: RemoteAudioTrack,
         publication: RemoteTrackPublication,
     ): string {
-        return publication.sid || track.sid || publication.name || track.name || "unknown";
+        return this.getPublicationId(publication) || track.sid || track.name || "unknown";
+    }
+
+    private getPublicationId(publication: RemoteTrackPublication): string {
+        return publication.sid || publication.name || "unknown";
     }
 
     private getPublicationLabel(publication: RemoteTrackPublication): string {
