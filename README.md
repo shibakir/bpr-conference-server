@@ -33,3 +33,7 @@ The API listens on `API_PORT` or `3001` by default.
 npm run build
 npm start
 ```
+
+## Deploy
+
+See [EC2 Docker deploy](docs/ec2-docker-deploy.md).
