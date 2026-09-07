@@ -339,7 +339,9 @@ class TranslationSessionManager {
                 );
                 await existingBridge.stop();
                 this.cleanupBridgeReference(sessionId, targetLanguage, existingBridge);
-                languageMap = this.translations.get(sessionId);
+                // Another request may have installed a replacement while stop was awaited.
+                // Re-enter the shared-start path before creating anything new.
+                return this.getOrCreate(sessionId, targetLanguage, organizerIdentity, options);
             }
         }
 

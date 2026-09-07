@@ -131,6 +131,14 @@ describe("TranslationSessionManager", () => {
             const later = await manager.getOrCreate(id, "de", "organizer-test");
             expect(later.getDiagnostics().settings).toEqual(a.getDiagnostics().settings);
             expect(start).toHaveBeenCalledTimes(2);
+            a.status = "error";
+            const [replacement, duplicateReplacement] = await Promise.all([
+                manager.getOrCreate(id, "cs", "organizer-test"),
+                manager.getOrCreate(id, "cs", "organizer-test"),
+            ]);
+            expect(replacement).not.toBe(a);
+            expect(duplicateReplacement).toBe(replacement);
+            expect(start).toHaveBeenCalledTimes(3);
         } finally {
             await manager.removeAllTranslations(id);
             vi.restoreAllMocks();
