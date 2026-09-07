@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import WebSocket from "ws";
 
 import { parseJson } from "../../api-request";
@@ -21,6 +21,7 @@ type GeminiSetupPayload = {
 class FakeWebSocket extends EventEmitter {
     readyState: number = WebSocket.CONNECTING;
     readonly sent: string[] = [];
+    readonly terminate = vi.fn(() => this.close());
     readonly close = vi.fn(() => {
         this.readyState = WebSocket.CLOSED;
         this.emit("close", 1000, Buffer.alloc(0));
@@ -73,6 +74,7 @@ function parseSentPayload<T>(socket: FakeWebSocket, index: number): T {
 }
 
 describe("GeminiLiveConnection", () => {
+    afterEach(() => vi.useRealTimers());
     it("waits for setupComplete before allowing audio and sends the expected setup", async () => {
         const socket = new FakeWebSocket();
         const { connection } = createConnection([socket]);
@@ -201,5 +203,83 @@ describe("GeminiLiveConnection", () => {
         secondSocket.receive({ setupComplete: {} });
         await connecting;
         expect(connection.isReady).toBe(true);
+    });
+});
+
+describe("Gemini connection cancellation", () => {
+    afterEach(() => vi.useRealTimers());
+
+    it("cancels pending setup and ignores a late acknowledgement after stop", async () => {
+        const socket = new FakeWebSocket();
+        const { connection, onMessage } = createConnection([socket]);
+        const connecting = connection.connect();
+        const rejected = expect(connecting).rejects.toThrow("stopped");
+        connection.stop();
+        socket.receive({ setupComplete: {} });
+        socket.receive({ serverContent: { turnComplete: true } });
+        await rejected;
+        expect(socket.terminate).toHaveBeenCalledOnce();
+        expect(connection.isReady).toBe(false);
+        expect(onMessage).not.toHaveBeenCalled();
+    });
+
+    it("closes both active and replacement sockets when stopped during GoAway", async () => {
+        const first = new FakeWebSocket();
+        const next = new FakeWebSocket();
+        const { connection, onMessage } = createConnection([first, next]);
+        const connecting = connection.connect();
+        first.open();
+        first.receive({ setupComplete: {} });
+        await connecting;
+        first.receive({ goAway: {} });
+        onMessage.mockClear();
+        connection.stop();
+        next.open();
+        next.receive({ setupComplete: {} });
+        next.receive({ serverContent: { turnComplete: true } });
+        await Promise.resolve();
+        expect(first.close).toHaveBeenCalledOnce();
+        expect(next.close).toHaveBeenCalledOnce();
+        expect(connection.isReady).toBe(false);
+        expect(onMessage).not.toHaveBeenCalled();
+    });
+
+    it("times out setup, disposes the candidate and cancels backoff on stop", async () => {
+        vi.useFakeTimers();
+        const first = new FakeWebSocket();
+        const next = new FakeWebSocket();
+        const factory = vi.fn().mockReturnValueOnce(first).mockReturnValueOnce(next);
+        const { connection } = createConnection([], { webSocketFactory: factory });
+        const connecting = connection.connect();
+        first.open();
+        first.receive({ setupComplete: {} });
+        await connecting;
+        first.receive({ goAway: {} });
+        await vi.advanceTimersByTimeAsync(15_000);
+        expect(next.terminate).toHaveBeenCalledOnce();
+        expect(connection.isReady).toBe(true);
+        connection.stop();
+        await vi.advanceTimersByTimeAsync(60_000);
+        expect(factory).toHaveBeenCalledTimes(2);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it("rejects messages from retired sockets after a successful handover", async () => {
+        const first = new FakeWebSocket();
+        const next = new FakeWebSocket();
+        const { connection, onMessage } = createConnection([first, next]);
+        const connecting = connection.connect();
+        first.open();
+        first.receive({ setupComplete: {} });
+        await connecting;
+        first.receive({ goAway: {} });
+        next.open();
+        next.receive({ setupComplete: {} });
+        onMessage.mockClear();
+        first.receive({ serverContent: { turnComplete: true } });
+        expect(onMessage).not.toHaveBeenCalled();
+        next.receive({ serverContent: { turnComplete: true } });
+        expect(onMessage).toHaveBeenCalledOnce();
+        connection.stop();
     });
 });

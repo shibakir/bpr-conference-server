@@ -95,3 +95,69 @@ describe("TranslationBridge", () => {
         expect(newPublication.setSubscribed).toHaveBeenCalledWith(true);
     });
 });
+
+describe("TranslationBridge lifecycle", () => {
+    it("shares concurrent stop, releases every resource and calls onStop once", async () => {
+        const bridge = createBridge();
+        let finishDisconnect!: () => void;
+        const disconnect = vi.fn(
+            () =>
+                new Promise<void>((resolve) => {
+                    finishDisconnect = resolve;
+                }),
+        );
+        const cancel = vi.fn().mockResolvedValue(undefined);
+        const close = vi.fn().mockResolvedValue(undefined);
+        const stopConnection = vi.fn();
+        const internals = bridge as unknown as {
+            room: { disconnect: typeof disconnect; removeAllListeners: ReturnType<typeof vi.fn> };
+            organizerAudioReader: { cancel: typeof cancel };
+            translatedAudioOutput: { close: typeof close };
+            geminiConnection: { stop: typeof stopConnection };
+        };
+        internals.room = { disconnect, removeAllListeners: vi.fn() };
+        internals.organizerAudioReader = { cancel };
+        internals.translatedAudioOutput = { close };
+        internals.geminiConnection = { stop: stopConnection };
+        const onStop = vi.fn(() => {
+            void bridge.stop();
+        });
+        bridge.onStop = onStop;
+        const first = bridge.stop();
+        const second = bridge.stop();
+        expect(first).toBe(second);
+        expect(bridge.status).toBe("closed");
+        await Promise.resolve();
+        expect(cancel).toHaveBeenCalledOnce();
+        expect(close).toHaveBeenCalledOnce();
+        expect(stopConnection).toHaveBeenCalledOnce();
+        finishDisconnect();
+        await Promise.all([first, second]);
+        expect(onStop).toHaveBeenCalledOnce();
+        expect(bridge.onStop).toBeUndefined();
+    });
+
+    it("does not resurrect a bridge stopped while startup awaits Gemini", async () => {
+        const bridge = createBridge();
+        let acknowledge!: () => void;
+        const internals = bridge as unknown as {
+            joinLiveKitRoom: () => Promise<void>;
+            connectGemini: () => Promise<void>;
+            subscribeToOrganizer: ReturnType<typeof vi.fn>;
+        };
+        internals.joinLiveKitRoom = async () => {};
+        internals.connectGemini = () =>
+            new Promise<void>((resolve) => {
+                acknowledge = resolve;
+            });
+        internals.subscribeToOrganizer = vi.fn();
+        const starting = bridge.start();
+        const rejected = expect(starting).rejects.toThrow("stopped during startup");
+        await Promise.resolve();
+        await bridge.stop();
+        acknowledge();
+        await rejected;
+        expect(bridge.status).toBe("closed");
+        expect(internals.subscribeToOrganizer).not.toHaveBeenCalled();
+    });
+});

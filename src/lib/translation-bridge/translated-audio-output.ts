@@ -59,6 +59,15 @@ export class TranslatedAudioOutput {
         this.isPublishing = false;
     }
 
+    async close(): Promise<void> {
+        const source = this.audioSource;
+        this.detach();
+        if (source) {
+            source.clearQueue();
+            await source.close();
+        }
+    }
+
     getTotalBacklogMs(): number {
         return this.getNativeQueueMs() + this.pendingDurationMs;
     }

@@ -1,3 +1,5 @@
+import type { ReadableStreamDefaultReader } from "node:stream/web";
+
 /**
  * TranslationBridge: Connects a LiveKit room to a Gemini Live API WebSocket
  * for real-time audio translation.
@@ -82,6 +84,8 @@ function endsWithSentenceBoundary(text: string): boolean {
 
 export class TranslationBridge {
     private room: Room | null = null;
+    private stopPromise: Promise<void> | null = null;
+    private organizerAudioReader: ReadableStreamDefaultReader<AudioFrame> | null = null;
     private localTrack: LocalAudioTrack | null = null;
     private publishedTrackSid: string = "";
     private transcriptionSegmentId: number = 0;
@@ -205,46 +209,69 @@ export class TranslationBridge {
         try {
             // 1. Generate token and join LiveKit room
             await this.joinLiveKitRoom();
+            this.assertStarting();
 
             // 2. Connect to Gemini Live API
             await this.connectGemini();
+            this.assertStarting();
 
             // 3. Subscribe to organizer's audio and wire up the pipeline
             await this.subscribeToOrganizer();
+            this.assertStarting();
 
             this.status = "active";
             this.log.info("Translation bridge is active");
         } catch (error) {
             this.log.error({ err: error }, "Failed to start translation bridge");
-            this.status = "error";
+            await this.stop();
             throw error;
         }
     }
 
-    async stop(): Promise<void> {
-        this.log.info("Stopping translation bridge");
+    private assertStarting(): void {
+        if (this.stopPromise || this.status === "closed")
+            throw new Error("Translation bridge stopped during startup");
+    }
+
+    stop(): Promise<void> {
+        if (this.stopPromise) return this.stopPromise;
         this.status = "closed";
-
-        if (this.interimTimeout) {
-            clearTimeout(this.interimTimeout);
+        // Defer cleanup until the shared promise is assigned, including reentrant callbacks.
+        this.stopPromise = Promise.resolve().then(async () => {
+            if (this.interimTimeout) clearTimeout(this.interimTimeout);
             this.interimTimeout = null;
-        }
-        this.pendingInterimText = "";
-
-        this.geminiConnection.stop();
-
-        if (this.room) {
-            await this.room.disconnect();
+            this.pendingInterimText = "";
+            this.geminiConnection.stop();
+            const reader = this.organizerAudioReader;
+            this.organizerAudioReader = null;
+            this.activeOrganizerAudioPipelineId = null;
+            const room = this.room;
             this.room = null;
-        }
+            room?.removeAllListeners();
+            const results = await Promise.allSettled([
+                reader?.cancel(),
+                room?.disconnect(),
+                this.translatedAudioOutput.close(),
+            ]);
+            this.localTrack = null;
+            const onStop = this.onStop;
+            delete this.onStop;
+            onStop?.();
+            for (const result of results) {
+                if (result.status === "rejected")
+                    this.log.warn({ err: result.reason }, "Translation resource cleanup failed");
+            }
+        });
+        return this.stopPromise;
+    }
 
-        this.translatedAudioOutput.detach();
-        this.localTrack = null;
+    private cancelOrganizerAudio(): void {
+        const reader = this.organizerAudioReader;
+        this.organizerAudioReader = null;
         this.activeOrganizerAudioPipelineId = null;
-
-        if (this.onStop) {
-            this.onStop();
-        }
+        void reader
+            ?.cancel()
+            .catch((error) => this.log.warn({ err: error }, "Audio reader cancellation failed"));
     }
 
     private async joinLiveKitRoom(): Promise<void> {
@@ -271,14 +298,19 @@ export class TranslationBridge {
 
         this.room.on(RoomEvent.Disconnected, () => {
             this.log.info("Disconnected from LiveKit room");
-            this.status = "closed";
+            void this.stop();
         });
 
-        await this.room.connect(this.livekitUrl, token, {
+        const room = this.room;
+        await room.connect(this.livekitUrl, token, {
             autoSubscribe: false,
             dynacast: false,
         });
 
+        if (this.stopPromise) {
+            await room.disconnect();
+            this.assertStarting();
+        }
         this.log.info({ identity: this.identity }, "Joined LiveKit room");
 
         if (!this.enableAudioTranslation) {
@@ -494,7 +526,7 @@ export class TranslationBridge {
                 { organizerIdentity: this.organizerIdentity },
                 "Organizer disconnected; keeping bridge active for control recovery",
             );
-            this.activeOrganizerAudioPipelineId = null;
+            this.cancelOrganizerAudio();
         });
 
         this.room.on(
@@ -646,6 +678,7 @@ export class TranslationBridge {
     }
 
     private pipeTrackToGemini(track: RemoteAudioTrack, publication: RemoteTrackPublication): void {
+        if (this.status === "closed") return;
         const pipelineId = this.getAudioPipelineId(track, publication);
 
         if (this.activeOrganizerAudioPipelineId) {
@@ -679,10 +712,11 @@ export class TranslationBridge {
 
         // Process frames as they arrive via ReadableStream reader
         const reader = audioStream.getReader();
+        this.organizerAudioReader = reader;
         const readLoop = async () => {
-            while (true) {
+            while (this.organizerAudioReader === reader && this.status !== "closed") {
                 const { done, value } = await reader.read();
-                if (done) break;
+                if (done || this.organizerAudioReader !== reader || this.stopPromise) break;
                 this.sendAudioToGemini(value);
             }
         };
@@ -692,9 +726,11 @@ export class TranslationBridge {
                 this.log.error({ err }, "Audio stream error");
             })
             .finally(() => {
-                if (this.activeOrganizerAudioPipelineId === pipelineId) {
+                if (this.organizerAudioReader === reader) {
+                    this.organizerAudioReader = null;
                     this.activeOrganizerAudioPipelineId = null;
                 }
+                reader.releaseLock();
             });
     }
 
@@ -715,7 +751,7 @@ export class TranslationBridge {
             },
             "Organizer audio pipeline ended",
         );
-        this.activeOrganizerAudioPipelineId = null;
+        this.cancelOrganizerAudio();
     }
 
     private getAudioPipelineId(
