@@ -20,6 +20,7 @@ type GeminiSetupPayload = {
 
 class FakeWebSocket extends EventEmitter {
     readyState: number = WebSocket.CONNECTING;
+    bufferedAmount = 0;
     readonly sent: string[] = [];
     readonly terminate = vi.fn(() => this.close());
     readonly close = vi.fn(() => {
@@ -280,6 +281,37 @@ describe("Gemini connection cancellation", () => {
         expect(onMessage).not.toHaveBeenCalled();
         next.receive({ serverContent: { turnComplete: true } });
         expect(onMessage).toHaveBeenCalledOnce();
+        connection.stop();
+    });
+});
+
+describe("Gemini input backpressure", () => {
+    afterEach(() => vi.useRealTimers());
+    it("drops input instead of buffering and restarts fresh after sustained congestion", async () => {
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "performance"] });
+        const first = new FakeWebSocket();
+        const next = new FakeWebSocket();
+        const onDiscontinuity = vi.fn();
+        const { connection } = createConnection([first, next], { onDiscontinuity });
+        const connecting = connection.connect();
+        first.open();
+        first.receive({ setupComplete: {} });
+        await connecting;
+        first.receive({ sessionResumptionUpdate: { resumable: true, newHandle: "old" } });
+        first.bufferedAmount = 50_000;
+        const frame = Buffer.alloc(3200).toString("base64");
+        expect(connection.sendAudio(frame, 16_000)).toBe(false);
+        expect(first.sent).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(1001);
+        expect(connection.sendAudio(frame, 16_000)).toBe(false);
+        expect(first.terminate).toHaveBeenCalledOnce();
+        expect(onDiscontinuity).toHaveBeenCalledOnce();
+        expect(connection.getInputDiagnostics().droppedInputMs).toBe(200);
+        await vi.advanceTimersByTimeAsync(601);
+        next.open();
+        expect(parseSentPayload<GeminiSetupPayload>(next, 0).setup.sessionResumption).toEqual({});
+        next.receive({ setupComplete: {} });
+        expect(connection.sendAudio(frame, 16_000)).toBe(true);
         connection.stop();
     });
 });

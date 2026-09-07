@@ -42,6 +42,7 @@ export type GeminiLiveConnectionOptions = {
     shouldReconnect: () => boolean;
     onMessage: (message: GeminiServerMessage) => void;
     webSocketFactory?: (url: string) => WebSocket;
+    onDiscontinuity?: () => void;
 };
 
 type GeminiSetup = {
@@ -87,6 +88,9 @@ export class GeminiLiveConnection {
     private cancelPending: (() => void) | null = null;
     private retryTimer: NodeJS.Timeout | null = null;
     private retryAttempt = 0;
+    private congestionSince: number | null = null;
+    private droppedInputMs = 0;
+    private resetCount = 0;
     private setupComplete = false;
     private resumptionHandle: string | null = null;
     private isStopped = false;
@@ -231,19 +235,66 @@ export class GeminiLiveConnection {
         return !this.isStopped && (!!this.pendingSocket || !!this.retryTimer || !this.isReady);
     }
 
+    getInputDiagnostics() {
+        return {
+            droppedInputMs: Math.round(this.droppedInputMs),
+            bufferedBytes: this.ws?.bufferedAmount ?? 0,
+            resets: this.resetCount,
+            recovering: this.isRecovering,
+        };
+    }
+
+    recordDroppedInput(durationMs: number): void {
+        this.droppedInputMs += Math.max(0, durationMs);
+    }
+
+    /** Drop at the input boundary instead of building a second unbounded queue in ws. */
     sendAudio(base64Audio: string, sampleRate: number): boolean {
-        if (!this.ws || !this.isReady) return false;
-        this.ws.send(
-            JSON.stringify({
-                realtimeInput: {
-                    audio: {
-                        mimeType: `audio/pcm;rate=${sampleRate}`,
-                        data: base64Audio,
-                    },
+        const durationMs = (Buffer.byteLength(base64Audio, "base64") / 2 / sampleRate) * 1000;
+        if (!this.ws || !this.isReady) {
+            this.recordDroppedInput(durationMs);
+            return false;
+        }
+        const payload = JSON.stringify({
+            realtimeInput: {
+                audio: {
+                    mimeType: `audio/pcm;rate=${sampleRate}`,
+                    data: base64Audio,
                 },
-            }),
-        );
+            },
+        });
+        // About 500ms of PCM including base64 plus JSON overhead, never a guessed PCM duration.
+        const maxBufferedBytes = Math.ceil((sampleRate * 2 * 0.5 * 4) / 3) + 2048;
+        if (this.ws.bufferedAmount + Buffer.byteLength(payload) > maxBufferedBytes) {
+            this.recordDroppedInput(durationMs);
+            this.congestionSince ??= performance.now();
+            if (performance.now() - this.congestionSince >= 1000) this.restartFresh();
+            return false;
+        }
+        this.congestionSince = null;
+        this.ws.send(payload, (error?: Error) => {
+            if (error && !this.isStopped) this.restartFresh();
+        });
         return true;
+    }
+
+    restartFresh(): void {
+        if (!this.canReconnect()) return;
+        this.resumptionHandle = null;
+        this.congestionSince = null;
+        this.resetCount++;
+        this.cancelPending?.();
+        const socket = this.ws;
+        this.ws = null;
+        this.setupComplete = false;
+        // terminate discards pending network writes; close would try to flush stale audio first.
+        if (socket) {
+            socket.removeAllListeners();
+            socket.on("error", () => {});
+            socket.terminate();
+        }
+        this.options.onDiscontinuity?.();
+        this.scheduleReconnect();
     }
 
     private retireSocket(socket: WebSocket): void {

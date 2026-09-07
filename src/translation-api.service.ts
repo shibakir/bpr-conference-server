@@ -4,6 +4,8 @@ import { HttpException, Injectable, type OnApplicationShutdown } from "@nestjs/c
 import { AccessToken } from "livekit-server-sdk";
 import type { z } from "zod";
 
+import { updateTranslationSettingsSchema } from "./lib/translation-settings";
+
 import type { Locale } from "./i18n/locales";
 import { API_ERROR_CODES, apiError } from "./lib/api-errors";
 import {
@@ -579,6 +581,52 @@ export class TranslationApiService implements OnApplicationShutdown {
 
             log.error({ err: error }, "Error unsubscribing from translation");
             return throwApiError(500, API_ERROR_CODES.UNSUBSCRIBE_FAILED, "Failed to unsubscribe");
+        }
+    }
+
+    getTranslationSettings(sessionId: string, headers: RequestHeaders) {
+        this.requireTranslationSettingsOwner(sessionId, getHeader(headers, "x-organizer-key"));
+        return this.manager.getTranslationSettings(sessionId);
+    }
+
+    updateTranslationSettings(sessionId: string, body: unknown) {
+        const parsed = updateTranslationSettingsSchema.safeParse(body);
+        if (!parsed.success)
+            return throwApiError(
+                400,
+                API_ERROR_CODES.INVALID_REQUEST,
+                "Invalid translation settings",
+                zodErrorDetails(parsed.error),
+            );
+        this.requireTranslationSettingsOwner(sessionId, parsed.data.organizerKey);
+        const current = this.manager.getTranslationSettings(sessionId)!;
+        if (current.settings.version !== parsed.data.expectedVersion) {
+            return throwApiError(
+                409,
+                API_ERROR_CODES.INVALID_REQUEST,
+                "Translation settings changed; refresh and retry",
+                { currentVersion: current.settings.version },
+            );
+        }
+        return this.manager.updateTranslationSettings(sessionId, {
+            inputFrameSizeMs: parsed.data.inputFrameSizeMs,
+            maxOutputBacklogMs: parsed.data.maxOutputBacklogMs,
+        });
+    }
+
+    private requireTranslationSettingsOwner(
+        sessionId: string,
+        organizerKey: string | undefined,
+    ): void {
+        if (!this.manager.getSession(sessionId)) {
+            throwApiError(404, API_ERROR_CODES.SESSION_NOT_FOUND, "Session not found");
+        }
+        if (!organizerKey || !this.manager.isOrganizerKeyValid(sessionId, organizerKey)) {
+            throwApiError(
+                403,
+                API_ERROR_CODES.ORGANIZER_ACCESS_REQUIRED,
+                "Organizer access required",
+            );
         }
     }
 

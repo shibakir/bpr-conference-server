@@ -20,6 +20,12 @@ import {
 } from "./server-env";
 import { DEFAULT_SESSION_DURATION_MINUTES } from "./session-duration";
 import { type BridgeStatus, TranslationBridge } from "./translation-bridge";
+import {
+    DEFAULT_TRANSLATION_SETTINGS,
+    INPUT_FRAME_OPTIONS_MS,
+    type TranslationSettings,
+    type TranslationSettingsSnapshot,
+} from "./translation-settings";
 import { participantWantsTranslation } from "./translation-bridge/participant-attributes";
 
 export interface TranslationInfo {
@@ -33,6 +39,7 @@ export interface SessionInfo {
     sessionId: string;
     organizerIdentity: string;
     organizerKeyHash: string;
+    translationSettings: TranslationSettingsSnapshot;
     createdAt: Date;
     durationMinutes: number;
     expiresAt: Date;
@@ -110,6 +117,7 @@ class TranslationSessionManager {
 
     // Map<sessionId, SessionInfo>
     private sessions: Map<string, SessionInfo> = new Map();
+    private bridgeStarts = new WeakMap<TranslationBridge, Promise<void>>();
 
     private sessionExpirationTimers: Map<string, NodeJS.Timeout> = new Map();
     private roomServiceClient: RoomServiceClient | null = null;
@@ -152,6 +160,7 @@ class TranslationSessionManager {
             sessionId,
             organizerIdentity,
             organizerKeyHash: options.organizerKeyHash,
+            translationSettings: { ...DEFAULT_TRANSLATION_SETTINGS },
             createdAt,
             durationMinutes,
             expiresAt: new Date(createdAt.getTime() + durationMinutes * 60_000),
@@ -304,7 +313,13 @@ class TranslationSessionManager {
         let languageMap = this.translations.get(sessionId);
         if (languageMap) {
             const existingBridge = languageMap.get(targetLanguage);
-            if (existingBridge && existingBridge.status === "active") {
+            if (
+                existingBridge &&
+                (existingBridge.status === "active" || existingBridge.status === "starting")
+            ) {
+                await this.bridgeStarts.get(existingBridge);
+                if (existingBridge.status !== "active")
+                    throw new Error("Translation stopped while starting");
                 log.info({ sessionId, targetLanguage }, "Reusing existing translation bridge");
                 existingBridge.subscriberCount++;
                 this.bridgeLastSubscriberSeenAt.set(existingBridge, Date.now());
@@ -343,6 +358,7 @@ class TranslationSessionManager {
             livekitApiSecret: liveKitCredentials.apiSecret,
             enableAudioTranslation: options.enableAudioTranslation !== false,
             enableTranscription: options.enableTranscription === true,
+            settings: session.translationSettings,
         };
 
         const bridge = new TranslationBridge(sessionId, targetLanguage, organizerIdentity, config);
@@ -361,7 +377,9 @@ class TranslationSessionManager {
         this.ensureReconcileTimer();
 
         try {
-            await bridge.start();
+            const starting = bridge.start();
+            this.bridgeStarts.set(bridge, starting);
+            await starting;
             bridge.subscriberCount = 1;
             return bridge;
         } catch (error) {
@@ -369,6 +387,54 @@ class TranslationSessionManager {
             this.cleanupBridgeReference(sessionId, targetLanguage, bridge);
             throw error;
         }
+    }
+
+    getTranslationSettings(sessionId: string) {
+        const session = this.getSession(sessionId);
+        if (!session) return undefined;
+        return {
+            settings: { ...session.translationSettings },
+            availableInputFrameSizesMs: [...INPUT_FRAME_OPTIONS_MS],
+            captionSyncAvailable: false,
+            translations: Array.from(this.translations.get(sessionId)?.entries() ?? []).map(
+                ([language, bridge]) => ({
+                    language,
+                    status: bridge.status,
+                    ...bridge.getDiagnostics(),
+                }),
+            ),
+        };
+    }
+
+    updateTranslationSettings(sessionId: string, settings: TranslationSettings) {
+        const session = this.getSession(sessionId);
+        if (!session) throw new Error("Session has ended");
+        const unchanged =
+            session.translationSettings.inputFrameSizeMs === settings.inputFrameSizeMs &&
+            session.translationSettings.maxOutputBacklogMs === settings.maxOutputBacklogMs;
+        const next = {
+            ...settings,
+            version: session.translationSettings.version + (unchanged ? 0 : 1),
+        };
+        session.translationSettings = next;
+        const errors: { language: string; message: string }[] = [];
+        // Synchronous application keeps two concurrent requests from interleaving language updates.
+        for (const [language, bridge] of this.translations.get(sessionId) ?? []) {
+            if (bridge.status === "closed") continue;
+            try {
+                bridge.applySettings(next);
+            } catch (error) {
+                errors.push({
+                    language,
+                    message: error instanceof Error ? error.message : "Settings update failed",
+                });
+            }
+        }
+        return {
+            ...this.getTranslationSettings(sessionId)!,
+            errors,
+            partialFailure: errors.length > 0,
+        };
     }
 
     getActiveTranslations(sessionId: string): TranslationInfo[] {

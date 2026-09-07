@@ -48,7 +48,7 @@ function createLatencyMetricsWindow(): LatencyMetricsWindow {
  */
 export class TranslationLatencyMetrics {
     private metrics = createLatencyMetricsWindow();
-    private windowStartedAt = Date.now();
+    private windowStartedAt = performance.now();
     private lastLogAt = 0;
     private lastGeminiAudioReceivedAt = 0;
     private firstInputAfterGeminiOutputIdleAt: number | null = null;

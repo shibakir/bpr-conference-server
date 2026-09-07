@@ -27,6 +27,11 @@ import {
 } from "@livekit/rtc-node";
 
 import { createLogger } from "../logger";
+import {
+    DEFAULT_TRANSLATION_SETTINGS,
+    type TranslationSettingsSnapshot,
+} from "../translation-settings";
+import { PcmPacketizer } from "./pcm-packetizer";
 import { GeminiLiveConnection, type GeminiServerMessage } from "./gemini-live-connection";
 import { TranslationLatencyMetrics } from "./latency-metrics";
 import { TranslationDataPublisher } from "./livekit-data-publisher";
@@ -85,6 +90,8 @@ function endsWithSentenceBoundary(text: string): boolean {
 export class TranslationBridge {
     private room: Room | null = null;
     private stopPromise: Promise<void> | null = null;
+    private settings: TranslationSettingsSnapshot;
+    private readonly packetizer: PcmPacketizer;
     private organizerAudioReader: ReadableStreamDefaultReader<AudioFrame> | null = null;
     private localTrack: LocalAudioTrack | null = null;
     private publishedTrackSid: string = "";
@@ -146,8 +153,11 @@ export class TranslationBridge {
             livekitApiSecret: string;
             enableAudioTranslation?: boolean;
             enableTranscription?: boolean;
+            settings?: TranslationSettingsSnapshot;
         },
     ) {
+        this.settings = { ...(config.settings ?? DEFAULT_TRANSLATION_SETTINGS) };
+        this.packetizer = new PcmPacketizer(this.settings.inputFrameSizeMs);
         this.sessionId = sessionId;
         this.targetLanguage = targetLanguage;
         this.organizerIdentity = organizerIdentity;
@@ -173,6 +183,11 @@ export class TranslationBridge {
             contextCompressionTargetTokens: this.contextCompressionTargetTokens,
             shouldReconnect: () => this.status === "active",
             onMessage: (message) => this.handleGeminiMessage(message),
+            onDiscontinuity: () => {
+                this.translatedAudioOutput.clear();
+                this.geminiConnection.recordDroppedInput(this.packetizer.reset());
+                this.completeCurrentTranscriptionSegment();
+            },
         });
         this.dataPublisher = new TranslationDataPublisher({
             targetLanguage,
@@ -188,7 +203,7 @@ export class TranslationBridge {
             targetLanguage,
             sampleRate: this.sampleRate,
             channels: this.channels,
-            maxBacklogMs: this.maxOutputBacklogMs,
+            maxBacklogMs: this.settings.maxOutputBacklogMs,
             targetBacklogMs: this.targetOutputBacklogMs,
             backlogLogIntervalMs: this.outputBacklogLogIntervalMs,
             backlogInfoThresholdMs: this.outputBacklogInfoThresholdMs,
@@ -201,6 +216,30 @@ export class TranslationBridge {
                 );
             },
         });
+    }
+
+    applySettings(settings: TranslationSettingsSnapshot): void {
+        if (this.status === "closed") throw new Error("Translation is closed");
+        this.translatedAudioOutput.setMaxBacklogMs(settings.maxOutputBacklogMs);
+        this.packetizer.setFrameSize(settings.inputFrameSizeMs);
+        this.settings = { ...settings };
+    }
+
+    getDiagnostics() {
+        const input = this.geminiConnection.getInputDiagnostics();
+        return {
+            settings: { ...this.settings },
+            ...this.translatedAudioOutput.getDiagnostics(),
+            ...input,
+            state: input.recovering
+                ? "recovering"
+                : this.translatedAudioOutput.getDiagnostics().state,
+            inputPendingMs: this.packetizer.pendingDurationMs,
+            endToEndAudioMs: null,
+            endToEndTextMs: null,
+            endToEndStatus: "unavailable" as const,
+            captionSyncAvailable: false,
+        };
     }
 
     async start(): Promise<void> {
@@ -242,6 +281,7 @@ export class TranslationBridge {
             this.interimTimeout = null;
             this.pendingInterimText = "";
             this.geminiConnection.stop();
+            this.packetizer.reset();
             const reader = this.organizerAudioReader;
             this.organizerAudioReader = null;
             this.activeOrganizerAudioPipelineId = null;
@@ -397,7 +437,7 @@ export class TranslationBridge {
             if (parts?.length) {
                 for (const part of parts) {
                     if (part.inlineData?.data) {
-                        const receivedAt = Date.now();
+                        const receivedAt = performance.now();
                         this.framesReceivedFromGemini++;
                         if (
                             this.framesReceivedFromGemini <= 3 ||
@@ -707,7 +747,7 @@ export class TranslationBridge {
         const audioStream = new AudioStream(track, {
             sampleRate: this.inputSampleRate,
             numChannels: this.channels,
-            frameSizeMs: 100,
+            frameSizeMs: 20,
         });
 
         // Process frames as they arrive via ReadableStream reader
@@ -770,40 +810,31 @@ export class TranslationBridge {
     }
 
     private sendAudioToGemini(frame: AudioFrame): void {
+        const receivedAt = performance.now();
+        const pcm = Buffer.from(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength);
         if (!this.geminiConnection.isReady) {
+            this.geminiConnection.recordDroppedInput(
+                (pcm.length / 2 / this.inputSampleRate) * 1000 + this.packetizer.reset(),
+            );
             return;
         }
-
-        try {
-            const frameReceivedAt = Date.now();
-            // Convert AudioFrame's Int16Array data to base64
-            const int16Data = frame.data;
-            const buffer = Buffer.from(
-                int16Data.buffer,
-                int16Data.byteOffset,
-                int16Data.byteLength,
-            );
-            const base64 = buffer.toString("base64");
-
-            this.framesSentToGemini++;
-            if (this.framesSentToGemini <= 3 || this.framesSentToGemini % 500 === 0) {
-                this.log.info(
-                    {
-                        base64Bytes: base64.length,
-                        frameNumber: this.framesSentToGemini,
-                        samples: int16Data.length,
-                    },
-                    "Sent audio frame to Gemini",
+        this.packetizer.push(pcm, receivedAt, (packet, packetReceivedAt) => {
+            if (performance.now() - packetReceivedAt > 500) {
+                this.geminiConnection.recordDroppedInput(
+                    (packet.length / 2 / this.inputSampleRate) * 1000,
+                );
+                return;
+            }
+            if (this.geminiConnection.sendAudio(packet.toString("base64"), this.inputSampleRate)) {
+                this.framesSentToGemini++;
+                const sentAt = performance.now();
+                this.latencyMetrics.recordInputSent(packetReceivedAt, sentAt);
+                this.latencyMetrics.maybeLog(
+                    sentAt,
+                    this.translatedAudioOutput.getTotalBacklogMs(),
                 );
             }
-
-            this.geminiConnection.sendAudio(base64, this.inputSampleRate);
-            const sentAt = Date.now();
-            this.latencyMetrics.recordInputSent(frameReceivedAt, sentAt);
-            this.latencyMetrics.maybeLog(sentAt, this.translatedAudioOutput.getTotalBacklogMs());
-        } catch (error) {
-            this.log.error({ err: error }, "Error sending audio to Gemini");
-        }
+        });
     }
 
     private handleInterimTranscription(text: string): void {

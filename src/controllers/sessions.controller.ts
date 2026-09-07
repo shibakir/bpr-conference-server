@@ -7,6 +7,7 @@ import {
     HttpCode,
     Inject,
     Param,
+    Patch,
     Post,
 } from "@nestjs/common";
 
@@ -33,6 +34,19 @@ export class SessionsController {
     @Get(":sessionId")
     getSession(@Param("sessionId") sessionId: string) {
         return this.api.getSession(sessionId);
+    }
+
+    @Get(":sessionId/translation-settings")
+    getTranslationSettings(
+        @Param("sessionId") sessionId: string,
+        @Headers() headers: RequestHeaders,
+    ) {
+        return this.api.getTranslationSettings(sessionId, headers);
+    }
+
+    @Patch(":sessionId/translation-settings")
+    updateTranslationSettings(@Param("sessionId") sessionId: string, @Body() body: unknown) {
+        return this.api.updateTranslationSettings(sessionId, body);
     }
 
     @Get(":sessionId/presenter")
