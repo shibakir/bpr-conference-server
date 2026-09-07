@@ -51,6 +51,7 @@ export class TranslatedAudioOutput {
     private lastSample = 0;
     private smoothNext = false;
     private generation = 0;
+    private cancelCapture: (() => void) | null = null;
     private readonly log;
 
     constructor(private readonly options: TranslatedAudioOutputOptions) {
@@ -74,6 +75,8 @@ export class TranslatedAudioOutput {
 
     detach(): void {
         this.generation++;
+        this.cancelCapture?.();
+        this.inFlightMs = 0;
         this.audioSource = null;
         this.pending = [];
         this.pendingSamples = 0;
@@ -252,9 +255,15 @@ export class TranslatedAudioOutput {
 
     private async captureWithTimeout(source: AudioSource, frame: AudioFrame): Promise<void> {
         let timeout: NodeJS.Timeout | undefined;
+        let cancel!: () => void;
+        const cancelled = new Promise<void>((resolve) => {
+            cancel = resolve;
+        });
+        this.cancelCapture = cancel;
         try {
             await Promise.race([
                 source.captureFrame(frame),
+                cancelled,
                 new Promise<never>((_, reject) => {
                     timeout = setTimeout(
                         () => reject(new Error("LiveKit audio capture stalled for 2s")),
@@ -265,6 +274,7 @@ export class TranslatedAudioOutput {
             ]);
         } finally {
             if (timeout) clearTimeout(timeout);
+            if (this.cancelCapture === cancel) this.cancelCapture = null;
         }
     }
 

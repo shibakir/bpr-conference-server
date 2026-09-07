@@ -67,6 +67,20 @@ describe("TranslatedAudioOutput", () => {
         expect(output.getTotalBacklogMs()).toBe(0);
         await output.close();
     });
+    it("cancels the capture watchdog immediately on stop even if native capture never resolves", async () => {
+        vi.useFakeTimers();
+        try {
+            const { output } = setup(() => new Promise(() => {}));
+            output.enqueue(Buffer.alloc(960).toString("base64"), 0, 1);
+            await output.close();
+            await vi.advanceTimersByTimeAsync(0);
+            expect(vi.getTimerCount()).toBe(0);
+            expect(output.getTotalBacklogMs()).toBe(0);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
     it("closes a stalled capture without starting a competing publisher", async () => {
         vi.useFakeTimers();
         try {

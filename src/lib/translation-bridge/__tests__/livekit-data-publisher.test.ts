@@ -204,4 +204,19 @@ describe("TranslationDataPublisher", () => {
         await publisher.publishTranscription(room, "stopped", false, 1);
         expect(publishData).toHaveBeenCalledTimes(2);
     });
+    it("cancels a stalled data-write watchdog immediately when stopped", async () => {
+        vi.useFakeTimers();
+        try {
+            const { room, publishData } = createRoom([]);
+            publishData.mockImplementation(() => new Promise(() => {}));
+            const publisher = new TranslationDataPublisher({ targetLanguage: "cs" });
+            const sending = publisher.publishTranscription(room, "Ahoj", true, 1);
+            await Promise.resolve();
+            publisher.stop();
+            await sending;
+            expect(vi.getTimerCount()).toBe(0);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
 });

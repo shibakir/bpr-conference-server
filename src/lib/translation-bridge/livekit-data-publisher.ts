@@ -47,6 +47,7 @@ export class TranslationDataPublisher {
     private pending = new Map<string, { room: Room; snapshot: Snapshot }>();
     private sending: Promise<void> | null = null;
     private stopped = false;
+    private cancelWrite: (() => void) | null = null;
     private droppedCaptionSegments = 0;
     private failedCaptionUpdates = 0;
 
@@ -77,6 +78,7 @@ export class TranslationDataPublisher {
     stop(): void {
         this.stopped = true;
         this.pending.clear();
+        this.cancelWrite?.();
     }
 
     publishTranscription(
@@ -165,6 +167,11 @@ export class TranslationDataPublisher {
                     )
                     .map((participant) => participant.identity);
                 let timeout: NodeJS.Timeout | undefined;
+                let cancel!: () => void;
+                const cancelled = new Promise<void>((resolve) => {
+                    cancel = resolve;
+                });
+                this.cancelWrite = cancel;
                 try {
                     const publish = room.localParticipant?.publishData(
                         new TextEncoder().encode(JSON.stringify(snapshot)),
@@ -178,6 +185,7 @@ export class TranslationDataPublisher {
                     );
                     await Promise.race([
                         publish,
+                        cancelled,
                         new Promise<never>((_, reject) => {
                             timeout = setTimeout(
                                 () => reject(new Error("Caption publication stalled for 5s")),
@@ -193,6 +201,7 @@ export class TranslationDataPublisher {
                     this.options.onPublicationError?.();
                 } finally {
                     if (timeout) clearTimeout(timeout);
+                    if (this.cancelWrite === cancel) this.cancelWrite = null;
                 }
             }
         } finally {
