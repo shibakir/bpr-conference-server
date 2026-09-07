@@ -67,6 +67,22 @@ describe("TranslatedAudioOutput", () => {
         expect(output.getTotalBacklogMs()).toBe(0);
         await output.close();
     });
+    it("closes a stalled capture without starting a competing publisher", async () => {
+        vi.useFakeTimers();
+        try {
+            const { output, source } = setup(() => new Promise(() => {}));
+            output.enqueue(Buffer.alloc(48_000).toString("base64"), 0, 1);
+            await vi.advanceTimersByTimeAsync(2001);
+            expect(source.captureFrame).toHaveBeenCalledOnce();
+            expect(source.close).toHaveBeenCalledOnce();
+            output.enqueue(Buffer.alloc(48_000).toString("base64"), 0, 2);
+            expect(source.captureFrame).toHaveBeenCalledOnce();
+            expect(output.getTotalBacklogMs()).toBe(0);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
     it("accelerates a sustained backlog smoothly and returns to normal after draining", async () => {
         vi.useFakeTimers();
         try {

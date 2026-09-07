@@ -1,5 +1,8 @@
-import { type ParticipantInfo } from "livekit-server-sdk";
-import { describe, expect, it } from "vitest";
+import { type ParticipantInfo, RoomServiceClient } from "livekit-server-sdk";
+import { describe, expect, it, vi } from "vitest";
+
+import * as env from "../server-env";
+import { TranslationBridge } from "../translation-bridge";
 
 import TranslationSessionManager, { hashOrganizerKey } from "../translation-session-manager";
 
@@ -82,6 +85,55 @@ describe("TranslationSessionManager", () => {
             expect(manager.hasActivePresenterLease(sessionId, organizerKey, "client-b")).toBe(true);
         } finally {
             await manager.removeAllTranslations(sessionId);
+        }
+    });
+    it("shares a starting bridge and applies settings changed during startup to it and later languages", async () => {
+        const manager = TranslationSessionManager.getInstance();
+        const id = `startup-${Date.now()}`;
+        vi.spyOn(env, "getGeminiApiKey").mockReturnValue("test");
+        vi.spyOn(env, "getLiveKitCredentials").mockReturnValue({
+            apiKey: "test",
+            apiSecret: "test",
+        });
+        vi.spyOn(env, "getLiveKitUrl").mockReturnValue("ws://test.invalid");
+        vi.spyOn(RoomServiceClient.prototype, "deleteRoom").mockResolvedValue(undefined);
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        const start = vi
+            .spyOn(TranslationBridge.prototype, "start")
+            .mockImplementation(async function (this: TranslationBridge) {
+                await gate;
+                this.status = "active";
+            });
+        manager.createSession(id, "organizer-test", {
+            enableAudioTranslation: true,
+            enableTranscription: true,
+            organizerKeyHash: hashOrganizerKey("test"),
+        });
+        try {
+            const first = manager.getOrCreate(id, "cs", "organizer-test");
+            const duplicate = manager.getOrCreate(id, "cs", "organizer-test");
+            expect(start).toHaveBeenCalledOnce();
+            manager.updateTranslationSettings(id, {
+                maxOutputBacklogMs: 3000,
+                inputFrameSizeMs: 200,
+            });
+            release();
+            const [a, b] = await Promise.all([first, duplicate]);
+            expect(a).toBe(b);
+            expect(a.getDiagnostics().settings).toEqual({
+                maxOutputBacklogMs: 3000,
+                inputFrameSizeMs: 200,
+                version: 2,
+            });
+            const later = await manager.getOrCreate(id, "de", "organizer-test");
+            expect(later.getDiagnostics().settings).toEqual(a.getDiagnostics().settings);
+            expect(start).toHaveBeenCalledTimes(2);
+        } finally {
+            await manager.removeAllTranslations(id);
+            vi.restoreAllMocks();
         }
     });
 });

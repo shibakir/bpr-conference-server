@@ -27,6 +27,7 @@ export type TranslatedAudioOutputOptions = {
     backlogInfoThresholdMs: number;
     isClosed: () => boolean;
     onFramePublished: (receivedAt: number, publishedAt: number) => void;
+    onPublicationError?: (error: unknown) => void;
 };
 
 /** Bounded output in 20ms blocks. The server queue is not end-to-end translation latency. */
@@ -249,6 +250,24 @@ export class TranslatedAudioOutput {
         }
     }
 
+    private async captureWithTimeout(source: AudioSource, frame: AudioFrame): Promise<void> {
+        let timeout: NodeJS.Timeout | undefined;
+        try {
+            await Promise.race([
+                source.captureFrame(frame),
+                new Promise<never>((_, reject) => {
+                    timeout = setTimeout(
+                        () => reject(new Error("LiveKit audio capture stalled for 2s")),
+                        2000,
+                    );
+                    timeout.unref();
+                }),
+            ]);
+        } finally {
+            if (timeout) clearTimeout(timeout);
+        }
+    }
+
     private async drain(): Promise<void> {
         if (this.publishing) return;
         this.publishing = true;
@@ -299,7 +318,8 @@ export class TranslatedAudioOutput {
                     this.smoothNext = false;
                 }
                 this.inFlightMs = this.ms(pcm.length);
-                await source.captureFrame(
+                await this.captureWithTimeout(
+                    source,
                     new AudioFrame(
                         pcm,
                         this.options.sampleRate,
@@ -315,6 +335,8 @@ export class TranslatedAudioOutput {
         } catch (error) {
             if (!this.options.isClosed())
                 this.log.error({ err: error }, "Audio publication failed");
+            this.options.onPublicationError?.(error);
+            await this.close();
         } finally {
             this.inFlightMs = 0;
             this.publishing = false;

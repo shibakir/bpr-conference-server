@@ -14,7 +14,6 @@ import type { ReadableStreamDefaultReader } from "node:stream/web";
 import {
     type AudioFrame,
     AudioSource,
-    AudioStream,
     LocalAudioTrack,
     type RemoteAudioTrack,
     type RemoteParticipant,
@@ -32,6 +31,7 @@ import {
     type TranslationSettingsSnapshot,
 } from "../translation-settings";
 import { prepareAudioTempo } from "./audio-tempo";
+import { BoundedAudioInput, type AudioInputReader } from "./bounded-audio-input";
 import { PcmPacketizer } from "./pcm-packetizer";
 import { GeminiLiveConnection, type GeminiServerMessage } from "./gemini-live-connection";
 import { TranslationLatencyMetrics } from "./latency-metrics";
@@ -93,7 +93,7 @@ export class TranslationBridge {
     private stopPromise: Promise<void> | null = null;
     private settings: TranslationSettingsSnapshot;
     private readonly packetizer: PcmPacketizer;
-    private organizerAudioReader: ReadableStreamDefaultReader<AudioFrame> | null = null;
+    private organizerAudioReader: AudioInputReader | null = null;
     private localTrack: LocalAudioTrack | null = null;
     private publishedTrackSid: string = "";
     private transcriptionSegmentId: number = 0;
@@ -155,6 +155,7 @@ export class TranslationBridge {
             enableAudioTranslation?: boolean;
             enableTranscription?: boolean;
             settings?: TranslationSettingsSnapshot;
+            streamEpoch?: number;
         },
     ) {
         this.settings = { ...(config.settings ?? DEFAULT_TRANSLATION_SETTINGS) };
@@ -187,11 +188,19 @@ export class TranslationBridge {
             onDiscontinuity: () => {
                 this.translatedAudioOutput.clear();
                 this.geminiConnection.recordDroppedInput(this.packetizer.reset());
+                if (this.interimTimeout) clearTimeout(this.interimTimeout);
+                this.interimTimeout = null;
+                this.pendingInterimText = "";
                 this.completeCurrentTranscriptionSegment();
+                this.dataPublisher.resetStream();
             },
         });
         this.dataPublisher = new TranslationDataPublisher({
             targetLanguage,
+            streamEpoch: config.streamEpoch ?? 0,
+            onPublicationError: () => {
+                void this.stop();
+            },
         });
         this.latencyMetrics = new TranslationLatencyMetrics({
             sessionId,
@@ -209,6 +218,13 @@ export class TranslationBridge {
             backlogLogIntervalMs: this.outputBacklogLogIntervalMs,
             backlogInfoThresholdMs: this.outputBacklogInfoThresholdMs,
             isClosed: () => this.status === "closed",
+            onPublicationError: (error) => {
+                this.log.error(
+                    { err: error },
+                    "Stopping stalled output; listeners may request a fresh bridge",
+                );
+                void this.stop();
+            },
             onFramePublished: (geminiAudioReceivedAt, publishedAt) => {
                 this.latencyMetrics.recordLiveKitAudioPublished(geminiAudioReceivedAt, publishedAt);
                 this.latencyMetrics.maybeLog(
@@ -232,10 +248,16 @@ export class TranslationBridge {
             settings: { ...this.settings },
             ...this.translatedAudioOutput.getDiagnostics(),
             ...input,
+            ...this.latencyMetrics.getDiagnostics(),
+            ...this.dataPublisher.getDiagnostics(),
             state: input.recovering
                 ? "recovering"
                 : this.translatedAudioOutput.getDiagnostics().state,
-            inputPendingMs: this.packetizer.pendingDurationMs,
+            inputPendingMs:
+                this.packetizer.pendingDurationMs +
+                (this.organizerAudioReader instanceof BoundedAudioInput
+                    ? this.organizerAudioReader.queuedDurationMs
+                    : 0),
             endToEndAudioMs: null,
             endToEndTextMs: null,
             endToEndStatus: "unavailable" as const,
@@ -278,6 +300,7 @@ export class TranslationBridge {
     stop(): Promise<void> {
         if (this.stopPromise) return this.stopPromise;
         this.status = "closed";
+        this.dataPublisher.stop();
         // Defer cleanup until the shared promise is assigned, including reentrant callbacks.
         this.stopPromise = Promise.resolve().then(async () => {
             if (this.interimTimeout) clearTimeout(this.interimTimeout);
@@ -296,7 +319,15 @@ export class TranslationBridge {
                 room?.disconnect(),
                 this.translatedAudioOutput.close(),
             ]);
+            const track = this.localTrack;
             this.localTrack = null;
+            if (track) {
+                try {
+                    await track.close(false);
+                } catch (error) {
+                    this.log.warn({ err: error }, "Local track cleanup failed");
+                }
+            }
             const onStop = this.onStop;
             delete this.onStop;
             onStop?.();
@@ -312,6 +343,7 @@ export class TranslationBridge {
         const reader = this.organizerAudioReader;
         this.organizerAudioReader = null;
         this.activeOrganizerAudioPipelineId = null;
+        this.geminiConnection.recordDroppedInput(this.packetizer.reset());
         void reader
             ?.cancel()
             .catch((error) => this.log.warn({ err: error }, "Audio reader cancellation failed"));
@@ -747,20 +779,15 @@ export class TranslationBridge {
             "Subscribed to organizer audio track; piping to Gemini",
         );
 
-        const audioStream = new AudioStream(track, {
-            sampleRate: this.inputSampleRate,
-            numChannels: this.channels,
-            frameSizeMs: 20,
-        });
-
-        // Process frames as they arrive via ReadableStream reader
-        const reader = audioStream.getReader();
+        const reader = new BoundedAudioInput(track, this.inputSampleRate, (durationMs) =>
+            this.geminiConnection.recordDroppedInput(durationMs + this.packetizer.reset()),
+        );
         this.organizerAudioReader = reader;
         const readLoop = async () => {
             while (this.organizerAudioReader === reader && this.status !== "closed") {
                 const { done, value } = await reader.read();
                 if (done || this.organizerAudioReader !== reader || this.stopPromise) break;
-                this.sendAudioToGemini(value);
+                this.sendAudioToGemini(value, reader.receivedAt(value));
             }
         };
 
@@ -812,8 +839,7 @@ export class TranslationBridge {
         return `sid=${publication.sid || "unknown"}, name=${publication.name || "unnamed"}, muted=${publication.muted ?? "unknown"}, subscribed=${publication.subscribed}`;
     }
 
-    private sendAudioToGemini(frame: AudioFrame): void {
-        const receivedAt = performance.now();
+    private sendAudioToGemini(frame: AudioFrame, receivedAt = performance.now()): void {
         const pcm = Buffer.from(frame.data.buffer, frame.data.byteOffset, frame.data.byteLength);
         if (!this.geminiConnection.isReady) {
             this.geminiConnection.recordDroppedInput(

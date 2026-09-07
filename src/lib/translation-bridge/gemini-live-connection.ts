@@ -89,6 +89,10 @@ export class GeminiLiveConnection {
     private retryTimer: NodeJS.Timeout | null = null;
     private retryAttempt = 0;
     private congestionSince: number | null = null;
+    private firstUnansweredVoiceAt: number | null = null;
+    private lastVoicedAt: number | null = null;
+    private unansweredVoiceMs = 0;
+    private freshRestarts: number[] = [];
     private droppedInputMs = 0;
     private resetCount = 0;
     private setupComplete = false;
@@ -232,7 +236,13 @@ export class GeminiLiveConnection {
     }
 
     get isRecovering(): boolean {
-        return !this.isStopped && (!!this.pendingSocket || !!this.retryTimer || !this.isReady);
+        return (
+            !this.isStopped &&
+            (!!this.pendingSocket ||
+                !!this.retryTimer ||
+                this.congestionSince !== null ||
+                !this.isReady)
+        );
     }
 
     getInputDiagnostics() {
@@ -250,7 +260,8 @@ export class GeminiLiveConnection {
 
     /** Drop at the input boundary instead of building a second unbounded queue in ws. */
     sendAudio(base64Audio: string, sampleRate: number): boolean {
-        const durationMs = (Buffer.byteLength(base64Audio, "base64") / 2 / sampleRate) * 1000;
+        const pcm = Buffer.from(base64Audio, "base64");
+        const durationMs = (pcm.length / 2 / sampleRate) * 1000;
         if (!this.ws || !this.isReady) {
             this.recordDroppedInput(durationMs);
             return false;
@@ -272,14 +283,33 @@ export class GeminiLiveConnection {
             return false;
         }
         this.congestionSince = null;
-        this.ws.send(payload, (error?: Error) => {
-            if (error && !this.isStopped) this.restartFresh();
-        });
+        const socket = this.ws;
+        try {
+            socket.send(payload, (error?: Error) => {
+                // A late callback from a retired socket must not tear down its replacement.
+                if (error && this.ws === socket && !this.isStopped) this.restartFresh("send-error");
+            });
+        } catch {
+            this.recordDroppedInput(durationMs);
+            this.restartFresh("send-error");
+            return false;
+        }
+        this.observeVoice(pcm, durationMs);
         return true;
     }
 
-    restartFresh(): void {
+    restartFresh(reason = "transport-congestion"): void {
         if (!this.canReconnect()) return;
+        const now = performance.now();
+        this.freshRestarts = this.freshRestarts.filter((time) => now - time < 300_000);
+        if (
+            this.freshRestarts.length >= 3 ||
+            now - (this.freshRestarts.at(-1) ?? -Infinity) < 60_000
+        )
+            return;
+        this.freshRestarts.push(now);
+        this.log.warn({ reason }, "Restarting Gemini with fresh context");
+        this.resetVoiceWatchdog();
         this.resumptionHandle = null;
         this.congestionSince = null;
         this.resetCount++;
@@ -295,6 +325,26 @@ export class GeminiLiveConnection {
         }
         this.options.onDiscontinuity?.();
         this.scheduleReconnect();
+    }
+
+    private resetVoiceWatchdog(): void {
+        this.firstUnansweredVoiceAt = null;
+        this.lastVoicedAt = null;
+        this.unansweredVoiceMs = 0;
+    }
+
+    private observeVoice(pcm: Buffer, durationMs: number): void {
+        let energy = 0;
+        for (let i = 0; i + 1 < pcm.length; i += 2) energy += pcm.readInt16LE(i) ** 2;
+        if (Math.sqrt(energy / Math.max(1, pcm.length / 2)) < 400) return;
+        const now = performance.now();
+        // Long pauses start a new observation window. Silence alone never triggers recovery.
+        if (this.lastVoicedAt !== null && now - this.lastVoicedAt > 2000) this.resetVoiceWatchdog();
+        this.firstUnansweredVoiceAt ??= now;
+        this.lastVoicedAt = now;
+        this.unansweredVoiceMs += durationMs;
+        if (now - this.firstUnansweredVoiceAt >= 30_000 && this.unansweredVoiceMs >= 15_000)
+            this.restartFresh("unanswered-voiced-input");
     }
 
     private retireSocket(socket: WebSocket): void {
@@ -325,6 +375,14 @@ export class GeminiLiveConnection {
     }
 
     private handleServerMessage(message: GeminiServerMessage): void {
+        if (
+            message.outputTranscription?.text ||
+            message.serverContent?.outputTranscription?.text ||
+            message.serverContent?.modelTurn?.parts?.some(
+                (part) => part.text || part.inlineData?.data,
+            )
+        )
+            this.resetVoiceWatchdog();
         const update = message.sessionResumptionUpdate;
         if (update?.resumable && update.newHandle) this.resumptionHandle = update.newHandle;
         if (message.goAway) this.reconnect();

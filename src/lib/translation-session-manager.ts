@@ -40,6 +40,7 @@ export interface SessionInfo {
     organizerIdentity: string;
     organizerKeyHash: string;
     translationSettings: TranslationSettingsSnapshot;
+    nextStreamEpoch: number;
     createdAt: Date;
     durationMinutes: number;
     expiresAt: Date;
@@ -161,6 +162,7 @@ class TranslationSessionManager {
             organizerIdentity,
             organizerKeyHash: options.organizerKeyHash,
             translationSettings: { ...DEFAULT_TRANSLATION_SETTINGS },
+            nextStreamEpoch: 0,
             createdAt,
             durationMinutes,
             expiresAt: new Date(createdAt.getTime() + durationMinutes * 60_000),
@@ -359,6 +361,7 @@ class TranslationSessionManager {
             enableAudioTranslation: options.enableAudioTranslation !== false,
             enableTranscription: options.enableTranscription === true,
             settings: session.translationSettings,
+            streamEpoch: ++session.nextStreamEpoch,
         };
 
         const bridge = new TranslationBridge(sessionId, targetLanguage, organizerIdentity, config);

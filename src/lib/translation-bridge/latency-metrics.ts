@@ -50,6 +50,10 @@ export class TranslationLatencyMetrics {
     private metrics = createLatencyMetricsWindow();
     private windowStartedAt = performance.now();
     private lastLogAt = 0;
+    private lastInputPackagingMs: number | null = null;
+    private lastOutputPublishMs: number | null = null;
+    private lastInputAt = -Infinity;
+    private lastPublishAt = -Infinity;
     private lastGeminiAudioReceivedAt = 0;
     private firstInputAfterGeminiOutputIdleAt: number | null = null;
     private readonly log;
@@ -66,6 +70,8 @@ export class TranslationLatencyMetrics {
     }
 
     recordInputSent(frameReceivedAt: number, sentAt: number): void {
+        this.lastInputPackagingMs = Math.round(Math.max(0, sentAt - frameReceivedAt));
+        this.lastInputAt = sentAt;
         this.metrics.inputFrames++;
         this.recordLatency(this.metrics.bridgeInputEncodeMs, sentAt - frameReceivedAt);
 
@@ -93,10 +99,22 @@ export class TranslationLatencyMetrics {
     }
 
     recordLiveKitAudioPublished(geminiAudioReceivedAt: number, publishedAt: number): void {
+        this.lastOutputPublishMs = Math.round(Math.max(0, publishedAt - geminiAudioReceivedAt));
+        this.lastPublishAt = publishedAt;
         this.recordLatency(
             this.metrics.geminiToLiveKitPublishMs,
             publishedAt - geminiAudioReceivedAt,
         );
+    }
+
+    getDiagnostics() {
+        const now = performance.now();
+        return {
+            inputPackagingMs: now - this.lastInputAt < 10_000 ? this.lastInputPackagingMs : null,
+            outputPublishDelayMs:
+                now - this.lastPublishAt < 10_000 ? this.lastOutputPublishMs : null,
+            outputPublishDelayQuality: "estimate" as const,
+        };
     }
 
     maybeLog(now: number, outputBacklogMs: number): void {

@@ -28,8 +28,10 @@ class FakeWebSocket extends EventEmitter {
         this.emit("close", 1000, Buffer.alloc(0));
     });
 
-    send(payload: string): void {
+    callbacks: Array<(error?: Error) => void> = [];
+    send(payload: string, callback?: (error?: Error) => void): void {
         this.sent.push(payload);
+        if (callback) this.callbacks.push(callback);
     }
 
     open(): void {
@@ -312,6 +314,57 @@ describe("Gemini input backpressure", () => {
         expect(parseSentPayload<GeminiSetupPayload>(next, 0).setup.sessionResumption).toEqual({});
         next.receive({ setupComplete: {} });
         expect(connection.sendAudio(frame, 16_000)).toBe(true);
+        connection.stop();
+    });
+    it("ignores delayed send errors from a retired socket", async () => {
+        const first = new FakeWebSocket();
+        const next = new FakeWebSocket();
+        const { connection } = createConnection([first, next]);
+        const connecting = connection.connect();
+        first.open();
+        first.receive({ setupComplete: {} });
+        await connecting;
+        connection.sendAudio(Buffer.alloc(3200).toString("base64"), 16000);
+        first.receive({ goAway: {} });
+        next.open();
+        next.receive({ setupComplete: {} });
+        first.callbacks[0]?.(new Error("late write failure"));
+        expect(connection.isReady).toBe(true);
+        expect(next.terminate).not.toHaveBeenCalled();
+        connection.stop();
+    });
+
+    it("recovers sustained unanswered voice but never resets for silence or short pauses", async () => {
+        vi.useFakeTimers();
+        const first = new FakeWebSocket();
+        const next = new FakeWebSocket();
+        const reset = vi.fn();
+        const { connection } = createConnection([first, next], { onDiscontinuity: reset });
+        const connecting = connection.connect();
+        first.open();
+        first.receive({ setupComplete: {} });
+        await connecting;
+        const silence = Buffer.alloc(3200).toString("base64");
+        for (let i = 0; i < 400; i++) {
+            connection.sendAudio(silence, 16000);
+            await vi.advanceTimersByTimeAsync(100);
+        }
+        expect(reset).not.toHaveBeenCalled();
+        const voice = Buffer.alloc(3200);
+        for (let i = 0; i < voice.length; i += 2) voice.writeInt16LE(1000, i);
+        for (let i = 0; i < 100; i++) {
+            connection.sendAudio(voice.toString("base64"), 16000);
+            await vi.advanceTimersByTimeAsync(100);
+        }
+        first.receive({ serverContent: { outputTranscription: { text: "response" } } });
+        expect(reset).not.toHaveBeenCalled();
+        for (let i = 0; i <= 300; i++) {
+            connection.sendAudio(voice.toString("base64"), 16000);
+            await vi.advanceTimersByTimeAsync(100);
+        }
+        expect(reset).toHaveBeenCalledOnce();
+        connection.restartFresh();
+        expect(reset).toHaveBeenCalledOnce(); // bounded recovery frequency
         connection.stop();
     });
 });

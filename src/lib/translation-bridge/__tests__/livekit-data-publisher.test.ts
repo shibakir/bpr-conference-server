@@ -60,7 +60,8 @@ describe("TranslationDataPublisher", () => {
         expect(parseJson(new TextDecoder().decode(encodedPayload))).toMatchObject({
             type: "transcription",
             language: "cs",
-            segmentId: "cs-4",
+            protocolVersion: 2,
+            segmentId: expect.stringMatching(/^cs-.+-1$/),
             text: "Ahoj",
             final: true,
         });
@@ -106,7 +107,8 @@ describe("TranslationDataPublisher", () => {
         expect(parseJson(new TextDecoder().decode(encodedPayload))).toMatchObject({
             type: "transcription",
             language: "cs",
-            segmentId: "cs-4",
+            protocolVersion: 2,
+            segmentId: expect.stringMatching(/^cs-.+-1$/),
             text: " průběžný text",
             final: false,
         });
@@ -130,5 +132,76 @@ describe("TranslationDataPublisher", () => {
             reliable: true,
             topic: "transcription",
         });
+    });
+    it("finalizes an already sent interim with a complete replacement snapshot", async () => {
+        const { room, publishData } = createRoom([{ identity: "listener-cs", language: "cs" }]);
+        const publisher = new TranslationDataPublisher({ targetLanguage: "cs", streamEpoch: 5 });
+        await publisher.publishTranscription(room, "Ahoj", true, 4);
+        await publisher.publishTranscription(room, " světe", true, 4);
+        await publisher.publishTranscription(room, "", false, 4);
+        const payloads = publishData.mock.calls.map(
+            ([data]) => JSON.parse(new TextDecoder().decode(data)) as Record<string, unknown>,
+        );
+        expect(payloads[2]).toMatchObject({
+            text: "",
+            snapshotText: "Ahoj světe",
+            revision: 3,
+            final: true,
+            streamEpoch: 5,
+        });
+        expect(payloads[0]?.["streamId"]).toBe(payloads[2]?.["streamId"]);
+    });
+
+    it("coalesces a slow data channel without accumulating deltas or blocking audio", async () => {
+        const { room, publishData } = createRoom([{ identity: "listener-cs", language: "cs" }]);
+        let release!: () => void;
+        publishData.mockImplementationOnce(
+            () =>
+                new Promise((resolve) => {
+                    release = resolve;
+                }),
+        );
+        const publisher = new TranslationDataPublisher({ targetLanguage: "cs" });
+        const first = publisher.publishTranscription(room, "0", true, 1);
+        await Promise.resolve();
+        for (let i = 1; i <= 100; i++) void publisher.publishTranscription(room, "a", true, 1);
+        expect(publishData).toHaveBeenCalledOnce();
+        release();
+        await first;
+        expect(publishData).toHaveBeenCalledTimes(2);
+        const last = JSON.parse(new TextDecoder().decode(publishData.mock.calls[1]![0])) as Record<
+            string,
+            unknown
+        >;
+        expect(last["snapshotText"]).toBe("0" + "a".repeat(100));
+        expect(last["text"]).toBe("a".repeat(100));
+    });
+
+    it("splits oversized Unicode segments below the reliable data packet limit", async () => {
+        const { room, publishData } = createRoom([]);
+        const publisher = new TranslationDataPublisher({ targetLanguage: "cs" });
+        await publisher.publishTranscription(room, "🦊".repeat(4000), false, 1);
+        const payloads = publishData.mock.calls.map(([data]) => {
+            expect(data.length).toBeLessThan(15000);
+            return JSON.parse(new TextDecoder().decode(data)) as Record<string, unknown>;
+        });
+        expect(payloads.map((p) => p["snapshotText"]).join("")).toBe("🦊".repeat(4000));
+        expect(payloads.every((p) => p["final"] === true)).toBe(true);
+    });
+
+    it("gives reset streams new identities and discards pending retired snapshots", async () => {
+        const { room, publishData } = createRoom([]);
+        const publisher = new TranslationDataPublisher({ targetLanguage: "cs" });
+        await publisher.publishTranscription(room, "old", true, 1);
+        publisher.resetStream();
+        await publisher.publishTranscription(room, "new", true, 1);
+        const payloads = publishData.mock.calls.map(
+            ([data]) => JSON.parse(new TextDecoder().decode(data)) as Record<string, unknown>,
+        );
+        expect(payloads[0]?.["streamId"]).not.toBe(payloads[1]?.["streamId"]);
+        expect(payloads[1]).toMatchObject({ snapshotText: "new", streamGeneration: 1 });
+        publisher.stop();
+        await publisher.publishTranscription(room, "stopped", false, 1);
+        expect(publishData).toHaveBeenCalledTimes(2);
     });
 });
