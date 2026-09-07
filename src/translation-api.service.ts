@@ -608,10 +608,14 @@ export class TranslationApiService implements OnApplicationShutdown {
                 { currentVersion: current.settings.version },
             );
         }
-        return this.manager.updateTranslationSettings(sessionId, {
-            inputFrameSizeMs: parsed.data.inputFrameSizeMs,
-            maxOutputBacklogMs: parsed.data.maxOutputBacklogMs,
-        });
+        return this.manager.updateTranslationSettings(
+            sessionId,
+            {
+                inputFrameSizeMs: parsed.data.inputFrameSizeMs,
+                maxOutputBacklogMs: parsed.data.maxOutputBacklogMs,
+            },
+            parsed.data.preset ?? "manual",
+        );
     }
 
     private requireTranslationSettingsOwner(

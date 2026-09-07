@@ -126,6 +126,7 @@ describe("TranslationSessionManager", () => {
             expect(a.getDiagnostics().settings).toEqual({
                 maxOutputBacklogMs: 3000,
                 inputFrameSizeMs: 200,
+                preset: "manual",
                 version: 2,
             });
             const later = await manager.getOrCreate(id, "de", "organizer-test");

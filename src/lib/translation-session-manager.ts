@@ -23,6 +23,7 @@ import { type BridgeStatus, TranslationBridge } from "./translation-bridge";
 import {
     DEFAULT_TRANSLATION_SETTINGS,
     INPUT_FRAME_OPTIONS_MS,
+    type TranslationPreset,
     type TranslationSettings,
     type TranslationSettingsSnapshot,
 } from "./translation-settings";
@@ -411,14 +412,20 @@ class TranslationSessionManager {
         };
     }
 
-    updateTranslationSettings(sessionId: string, settings: TranslationSettings) {
+    updateTranslationSettings(
+        sessionId: string,
+        settings: TranslationSettings,
+        preset: TranslationPreset = "manual",
+    ) {
         const session = this.getSession(sessionId);
         if (!session) throw new Error("Session has ended");
         const unchanged =
             session.translationSettings.inputFrameSizeMs === settings.inputFrameSizeMs &&
-            session.translationSettings.maxOutputBacklogMs === settings.maxOutputBacklogMs;
+            session.translationSettings.maxOutputBacklogMs === settings.maxOutputBacklogMs &&
+            session.translationSettings.preset === preset;
         const next = {
             ...settings,
+            preset,
             version: session.translationSettings.version + (unchanged ? 0 : 1),
         };
         session.translationSettings = next;

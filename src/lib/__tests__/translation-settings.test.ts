@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { TranslationApiService } from "../../translation-api.service";
 import TranslationSessionManager, { hashOrganizerKey } from "../translation-session-manager";
-import { updateTranslationSettingsSchema } from "../translation-settings";
+import { TRANSLATION_PRESETS, updateTranslationSettingsSchema } from "../translation-settings";
 
 const manager = TranslationSessionManager.getInstance();
 const sessions: string[] = [];
@@ -62,7 +62,16 @@ describe("Translation settings API", () => {
         const { id, api } = session();
         expect(
             api.getTranslationSettings(id, { "x-organizer-key": "owner-key" })?.settings,
-        ).toEqual({ maxOutputBacklogMs: 1000, inputFrameSizeMs: 100, version: 1 });
+        ).toEqual({
+            maxOutputBacklogMs: 2000,
+            inputFrameSizeMs: 100,
+            preset: "balanced",
+            version: 1,
+        });
+        expect(
+            api.getTranslationSettings(id, { "x-organizer-key": "owner-key" })
+                ?.availableInputFrameSizesMs,
+        ).toEqual([50, 100, 200, 300]);
         const body = {
             organizerKey: "owner-key",
             expectedVersion: 1,
@@ -73,12 +82,80 @@ describe("Translation settings API", () => {
         expect(updated.settings).toEqual({
             maxOutputBacklogMs: 3000,
             inputFrameSizeMs: 50,
+            preset: "manual",
             version: 2,
         });
         expect(status(() => api.updateTranslationSettings(id, body))).toBe(409);
         expect(
             api.getTranslationSettings(id, { "x-organizer-key": "owner-key" })?.settings,
         ).toEqual(updated.settings);
+    });
+
+    it.each(Object.entries(TRANSLATION_PRESETS))(
+        "persists the %s preset and its values",
+        (preset, settings) => {
+            const { id, api } = session();
+            const updated = api.updateTranslationSettings(id, {
+                organizerKey: "owner-key",
+                expectedVersion: 1,
+                preset,
+                ...settings,
+            });
+            expect(updated.settings).toEqual({
+                ...settings,
+                preset,
+                version: preset === "balanced" ? 1 : 2,
+            });
+            expect(
+                api.getTranslationSettings(id, { "x-organizer-key": "owner-key" })?.settings,
+            ).toEqual(updated.settings);
+        },
+    );
+
+    it("persists manual mode even when its values equal a preset, and detects mode-only conflicts", () => {
+        const { id, api } = session();
+        const body = {
+            organizerKey: "owner-key",
+            expectedVersion: 1,
+            preset: "manual",
+            ...TRANSLATION_PRESETS.balanced,
+        };
+        const updated = api.updateTranslationSettings(id, body);
+        expect(updated.settings).toEqual({
+            ...TRANSLATION_PRESETS.balanced,
+            preset: "manual",
+            version: 2,
+        });
+        expect(
+            status(() => api.updateTranslationSettings(id, { ...body, preset: "balanced" })),
+        ).toBe(409);
+        expect(
+            api.getTranslationSettings(id, { "x-organizer-key": "owner-key" })?.settings.preset,
+        ).toBe("manual");
+        expect(
+            api.updateTranslationSettings(id, { ...body, expectedVersion: 2 }).settings.version,
+        ).toBe(2);
+    });
+
+    it("rejects mismatched presets and accepts older clients as manual settings", () => {
+        const { id, api } = session();
+        const body = {
+            organizerKey: "owner-key",
+            expectedVersion: 1,
+            ...TRANSLATION_PRESETS.poorConnection,
+        };
+        expect(
+            status(() => api.updateTranslationSettings(id, { ...body, preset: "quality" })),
+        ).toBe(400);
+        expect(
+            status(() => api.updateTranslationSettings(id, { ...body, preset: "unknown" })),
+        ).toBe(400);
+        expect(manager.getTranslationSettings(id)?.settings.version).toBe(1);
+        expect(api.updateTranslationSettings(id, body).settings).toEqual({
+            ...TRANSLATION_PRESETS.poorConnection,
+            preset: "manual",
+            version: 2,
+        });
     });
 
     it("applies settings to active bridges and exposes failures per language", async () => {
@@ -108,11 +185,19 @@ describe("Translation settings API", () => {
                 ["de", bad],
             ]),
         );
-        const result = manager.updateTranslationSettings(id, {
-            maxOutputBacklogMs: 2000,
-            inputFrameSizeMs: 200,
-        });
+        const result = manager.updateTranslationSettings(
+            id,
+            {
+                ...TRANSLATION_PRESETS.poorConnection,
+            },
+            "poorConnection",
+        );
         expect(good.applySettings).toHaveBeenCalledOnce();
+        expect(good.applySettings).toHaveBeenCalledWith({
+            ...TRANSLATION_PRESETS.poorConnection,
+            preset: "poorConnection",
+            version: 2,
+        });
         expect(result.partialFailure).toBe(true);
         expect(result.errors).toEqual([{ language: "de", message: "unavailable" }]);
         expect(result.translations.find((t) => t.language === "cs")?.settings.version).toBe(2);
