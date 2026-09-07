@@ -1,3 +1,4 @@
+import { prepareAudioTempo } from "../audio-tempo";
 import { EventEmitter } from "node:events";
 
 import {
@@ -6,7 +7,7 @@ import {
     type RemoteParticipant,
     type RemoteTrackPublication,
 } from "@livekit/rtc-node";
-import { describe, expect, it, vi } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 
 import { TranslationBridge } from "../index";
 
@@ -153,7 +154,7 @@ describe("TranslationBridge lifecycle", () => {
         internals.subscribeToOrganizer = vi.fn();
         const starting = bridge.start();
         const rejected = expect(starting).rejects.toThrow("stopped during startup");
-        await Promise.resolve();
+        await vi.waitFor(() => expect(acknowledge).toBeTypeOf("function"));
         await bridge.stop();
         acknowledge();
         await rejected;
@@ -161,3 +162,5 @@ describe("TranslationBridge lifecycle", () => {
         expect(internals.subscribeToOrganizer).not.toHaveBeenCalled();
     });
 });
+
+beforeAll(() => prepareAudioTempo());

@@ -21,8 +21,8 @@ function getApiPort() {
 async function bootstrap() {
     const [{ NestFactory }, { AppModule }, { createLogger }] = await Promise.all([
         import("@nestjs/core"),
-        import("./app.module"),
-        import("./lib/logger"),
+        import("./app.module.js"),
+        import("./lib/logger.js"),
     ]);
     const log = createLogger({ service: "nest-api" });
     const app = await NestFactory.create(AppModule, { logger: false });

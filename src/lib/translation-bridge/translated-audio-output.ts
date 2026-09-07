@@ -1,6 +1,14 @@
 import { AudioFrame, type AudioSource } from "@livekit/rtc-node";
 
 import { createLogger } from "../logger";
+import { AudioTempo } from "./audio-tempo";
+
+const SOFT_LIMIT_RATIO = 0.7;
+const RECOVERY_TARGET_RATIO = 0.5;
+const SOFT_LIMIT_HOLD_MS = 200;
+const SPEED_STEP_INTERVAL_MS = 100;
+const SPEED_STEP = 0.01;
+const MAX_PLAYBACK_SPEED = 1.15;
 
 type QueuedFrame = {
     pcm: Int16Array;
@@ -25,6 +33,13 @@ export type TranslatedAudioOutputOptions = {
 export class TranslatedAudioOutput {
     private audioSource: AudioSource | null = null;
     private pending: QueuedFrame[] = [];
+    private ready: QueuedFrame[] = [];
+    private readySamples = 0;
+    private tempo: AudioTempo | null = null;
+    private processorFrame: QueuedFrame | null = null;
+    private speed = 1;
+    private highBacklogSince: number | null = null;
+    private lastSpeedChangeAt = 0;
     private pendingSamples = 0;
     private nextSample = 0;
     private publishing = false;
@@ -39,6 +54,7 @@ export class TranslatedAudioOutput {
 
     constructor(private readonly options: TranslatedAudioOutputOptions) {
         this.maxBacklogMs = options.maxBacklogMs;
+
         this.log = createLogger({
             component: "translated-audio-output",
             targetLanguage: options.targetLanguage,
@@ -46,6 +62,7 @@ export class TranslatedAudioOutput {
     }
 
     attach(source: AudioSource): void {
+        this.tempo = new AudioTempo(this.options.sampleRate);
         this.audioSource = source;
     }
 
@@ -59,6 +76,7 @@ export class TranslatedAudioOutput {
         this.audioSource = null;
         this.pending = [];
         this.pendingSamples = 0;
+        this.clearProcessor();
     }
 
     async close(): Promise<void> {
@@ -74,6 +92,7 @@ export class TranslatedAudioOutput {
         this.recordDrop(this.getTotalBacklogMs(), "stream-reset");
         this.pending = [];
         this.pendingSamples = 0;
+        this.clearProcessor();
         // During capture, wait for the single publisher before touching the native queue.
         this.clearNativeRequested = true;
         if (!this.publishing) this.clearNative();
@@ -88,7 +107,8 @@ export class TranslatedAudioOutput {
 
     getTotalBacklogMs(): number {
         return (
-            this.ms(this.pendingSamples) +
+            this.ms(this.pendingSamples + this.readySamples) +
+            (this.tempo?.pendingDurationMs ?? 0) +
             Math.max(this.audioSource?.queuedDuration ?? 0, this.inFlightMs)
         );
     }
@@ -97,11 +117,13 @@ export class TranslatedAudioOutput {
         return {
             outputBacklogMs: Math.round(this.getTotalBacklogMs()),
             droppedOutputMs: Math.round(this.droppedDurationMs),
-            playbackSpeed: 1,
+            playbackSpeed: this.speed,
             state:
                 performance.now() - this.lastDropAt < 2000
                     ? ("dropping" as const)
-                    : ("normal" as const),
+                    : this.speed > 1
+                      ? ("accelerating" as const)
+                      : ("normal" as const),
         };
     }
 
@@ -151,7 +173,10 @@ export class TranslatedAudioOutput {
 
     private trim(): void {
         if (this.getTotalBacklogMs() <= this.maxBacklogMs) return;
-        const targetMs = this.maxBacklogMs * 0.5;
+        const targetMs = this.maxBacklogMs * RECOVERY_TARGET_RATIO;
+        const processorDroppedMs =
+            (this.tempo?.pendingDurationMs ?? 0) + this.ms(this.readySamples);
+        this.clearProcessor();
         let droppedSamples = 0;
         const first = this.pending[0]?.startSample;
         while (this.pending.length && this.getTotalBacklogMs() > targetMs) {
@@ -177,14 +202,50 @@ export class TranslatedAudioOutput {
             droppedSamples += frame.pcm.length;
             extra += frame.pcm.length;
         }
-        if (droppedSamples) {
+        if (droppedSamples || processorDroppedMs) {
             this.recordDrop(
-                this.ms(droppedSamples),
+                this.ms(droppedSamples) + processorDroppedMs,
                 "queue-limit",
                 first,
                 first === undefined ? undefined : first + droppedSamples,
             );
             this.smoothNext = true;
+        }
+    }
+
+    private clearProcessor(): void {
+        this.ready = [];
+        this.readySamples = 0;
+        this.tempo?.clear();
+        this.processorFrame = null;
+    }
+
+    private updateSpeed(): void {
+        const backlogMs = this.getTotalBacklogMs();
+        const now = performance.now();
+        if (backlogMs > this.maxBacklogMs * SOFT_LIMIT_RATIO) this.highBacklogSince ??= now;
+        else this.highBacklogSince = null;
+        if (now - this.lastSpeedChangeAt < SPEED_STEP_INTERVAL_MS) return;
+        let next = this.speed;
+        if (backlogMs <= this.maxBacklogMs * RECOVERY_TARGET_RATIO)
+            next = Math.max(1, this.speed - SPEED_STEP);
+        else if (
+            this.highBacklogSince !== null &&
+            now - this.highBacklogSince >= SOFT_LIMIT_HOLD_MS
+        )
+            next = Math.min(MAX_PLAYBACK_SPEED, this.speed + SPEED_STEP);
+        if (next !== this.speed) {
+            this.speed = Math.round(next * 100) / 100;
+            this.lastSpeedChangeAt = now;
+        }
+    }
+
+    private addReady(pcm: Int16Array, original: QueuedFrame): void {
+        const blockSize = this.options.sampleRate / 50;
+        for (let offset = 0; offset < pcm.length; offset += blockSize) {
+            const block = pcm.slice(offset, offset + blockSize);
+            this.ready.push({ ...original, pcm: block });
+            this.readySamples += block.length;
         }
     }
 
@@ -194,16 +255,37 @@ export class TranslatedAudioOutput {
         const generation = this.generation;
         try {
             while (
-                this.pending.length &&
+                (this.pending.length ||
+                    this.ready.length ||
+                    (this.tempo?.pendingDurationMs ?? 0) > 0) &&
                 !this.options.isClosed() &&
                 generation === this.generation
             ) {
                 if (this.clearNativeRequested) this.clearNative();
                 this.trim();
-                const queued = this.pending.shift();
+                this.updateSpeed();
+                if (!this.ready.length) {
+                    const raw = this.pending.shift();
+                    if (raw) {
+                        this.pendingSamples -= raw.pcm.length;
+                        if (this.speed === 1 && (this.tempo?.pendingDurationMs ?? 0) === 0)
+                            this.addReady(raw.pcm, raw);
+                        else {
+                            this.processorFrame ??= raw;
+                            const processed = this.tempo!.push(raw.pcm, this.speed);
+                            this.addReady(processed, this.processorFrame);
+                            if (processed.length) this.processorFrame = raw;
+                        }
+                    } else if (this.processorFrame) {
+                        this.addReady(this.tempo!.flush(), this.processorFrame);
+                        this.processorFrame = null;
+                    }
+                }
+                const queued = this.ready.shift();
                 const source = this.audioSource;
-                if (!queued || !source) break;
-                this.pendingSamples -= queued.pcm.length;
+                if (!source) break;
+                if (!queued) continue;
+                this.readySamples -= queued.pcm.length;
                 const pcm = queued.pcm;
                 if (this.smoothNext) {
                     const fadeSamples = Math.min(

@@ -31,6 +31,7 @@ import {
     DEFAULT_TRANSLATION_SETTINGS,
     type TranslationSettingsSnapshot,
 } from "../translation-settings";
+import { prepareAudioTempo } from "./audio-tempo";
 import { PcmPacketizer } from "./pcm-packetizer";
 import { GeminiLiveConnection, type GeminiServerMessage } from "./gemini-live-connection";
 import { TranslationLatencyMetrics } from "./latency-metrics";
@@ -246,6 +247,8 @@ export class TranslationBridge {
         this.log.info("Starting translation bridge");
 
         try {
+            await prepareAudioTempo();
+            this.assertStarting();
             // 1. Generate token and join LiveKit room
             await this.joinLiveKitRoom();
             this.assertStarting();

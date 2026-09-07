@@ -1,5 +1,6 @@
+import { prepareAudioTempo } from "../audio-tempo";
 import type { AudioFrame, AudioSource } from "@livekit/rtc-node";
-import { describe, expect, it, vi } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 
 import { TranslatedAudioOutput } from "../translated-audio-output";
 
@@ -66,4 +67,36 @@ describe("TranslatedAudioOutput", () => {
         expect(output.getTotalBacklogMs()).toBe(0);
         await output.close();
     });
+    it("accelerates a sustained backlog smoothly and returns to normal after draining", async () => {
+        vi.useFakeTimers();
+        try {
+            const { output } = setup(
+                (frame) =>
+                    new Promise((resolve) => setTimeout(resolve, frame.samplesPerChannel / 24)),
+            );
+            // Keep the queue between the soft and hard limits for two seconds.
+            output.enqueue(Buffer.alloc(48_000 * 0.9).toString("base64"), 0, 1);
+            for (let i = 0; i < 100; i++) {
+                await vi.advanceTimersByTimeAsync(20);
+                output.enqueue(Buffer.alloc(960).toString("base64"), 0, i + 2);
+                expect(output.getDiagnostics().playbackSpeed).toBeLessThanOrEqual(1.15);
+                expect(output.getTotalBacklogMs()).toBeLessThanOrEqual(1000);
+            }
+            expect(output.getDiagnostics().playbackSpeed).toBeGreaterThan(1);
+            expect(output.getDiagnostics().droppedOutputMs).toBe(0);
+            await vi.advanceTimersByTimeAsync(3000);
+            // Future small packets let the controller finish returning to normal.
+            for (let i = 0; i < 20; i++) {
+                output.enqueue(Buffer.alloc(960).toString("base64"), 0, i + 102);
+                await vi.advanceTimersByTimeAsync(100);
+            }
+            expect(output.getDiagnostics().playbackSpeed).toBe(1);
+            expect(output.getTotalBacklogMs()).toBe(0);
+            await output.close();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
 });
+
+beforeAll(() => prepareAudioTempo());
