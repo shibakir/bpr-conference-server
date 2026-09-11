@@ -15,6 +15,11 @@ type GeminiSetupPayload = {
         model: string;
         outputAudioTranscription?: unknown;
         sessionResumption?: unknown;
+        systemInstruction?: {
+            parts: Array<{
+                text: string;
+            }>;
+        };
     };
 };
 
@@ -105,6 +110,24 @@ describe("GeminiLiveConnection", () => {
                 },
             },
         });
+    });
+
+    it("sends custom system instructions in the setup payload", async () => {
+        const socket = new FakeWebSocket();
+        const { connection } = createConnection([socket], {
+            systemInstruction: "Prefer BPR terminology.",
+        });
+
+        const connecting = connection.connect();
+        socket.open();
+
+        const setupPayload = parseSentPayload<GeminiSetupPayload>(socket, 0);
+        expect(setupPayload.setup.systemInstruction).toEqual({
+            parts: [{ text: "Prefer BPR terminology." }],
+        });
+
+        socket.receive({ setupComplete: {} });
+        await connecting;
     });
 
     it("resumes a session after GoAway and retires the old socket", async () => {

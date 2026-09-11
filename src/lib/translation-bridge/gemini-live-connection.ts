@@ -39,6 +39,7 @@ export type GeminiLiveConnectionOptions = {
     enableTranscription: boolean;
     contextCompressionTriggerTokens: number;
     contextCompressionTargetTokens: number;
+    systemInstruction?: string;
     shouldReconnect: () => boolean;
     onMessage: (message: GeminiServerMessage) => void;
     webSocketFactory?: (url: string) => WebSocket;
@@ -47,6 +48,11 @@ export type GeminiLiveConnectionOptions = {
 
 type GeminiSetup = {
     model: string;
+    systemInstruction?: {
+        parts: Array<{
+            text: string;
+        }>;
+    };
     outputAudioTranscription?: Record<string, never>;
     generationConfig: {
         responseModalities: string[];
@@ -417,6 +423,12 @@ export class GeminiLiveConnection {
             },
         };
 
+        if (this.options.systemInstruction) {
+            setup.systemInstruction = {
+                parts: [{ text: this.options.systemInstruction }],
+            };
+        }
+
         // The raw v1beta WebSocket schema accepts audio transcription config on
         // the setup root, not inside generationConfig.
         if (this.options.enableTranscription) {
@@ -424,8 +436,22 @@ export class GeminiLiveConnection {
         }
 
         const setupMessage = { setup };
+        const loggedSetupMessage = this.options.systemInstruction
+            ? {
+                  setup: {
+                      ...setup,
+                      systemInstruction: {
+                          parts: [
+                              {
+                                  text: `[redacted length=${this.options.systemInstruction.length}]`,
+                              },
+                          ],
+                      },
+                  },
+              }
+            : setupMessage;
         this.log.info(
-            { resuming: !!this.resumptionHandle, setup: setupMessage },
+            { resuming: !!this.resumptionHandle, setup: loggedSetupMessage },
             "Sending Gemini setup",
         );
         ws.send(JSON.stringify(setupMessage));

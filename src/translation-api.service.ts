@@ -222,6 +222,9 @@ export class TranslationApiService implements OnApplicationShutdown {
                 organizerKeyHash: hashOrganizerKey(organizerKey),
                 durationMinutes,
                 ...(allowedLanguages ? { allowedLanguages } : {}),
+                ...(parsed.data.systemInstruction
+                    ? { systemInstruction: parsed.data.systemInstruction }
+                    : {}),
             });
             const session = this.manager.getSession(sessionId);
 

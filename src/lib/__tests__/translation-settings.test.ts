@@ -91,6 +91,26 @@ describe("Translation settings API", () => {
         ).toEqual(updated.settings);
     });
 
+    it("stores trimmed system instructions without exposing them in public session details", async () => {
+        const api = new TranslationApiService();
+        const eventId = `instructions-${randomUUID()}`;
+
+        const created = await api.createSession(
+            {
+                eventId,
+                locale: "en",
+                systemInstruction: "  Prefer BPR terminology.  ",
+                translationOutputs: ["audio"],
+            },
+            { host: "localhost:3000" },
+        );
+        const sessionId = (created as { sessionId: string }).sessionId;
+        sessions.push(sessionId);
+
+        expect(manager.getSession(sessionId)?.systemInstruction).toBe("Prefer BPR terminology.");
+        expect(api.getSession(sessionId)).not.toHaveProperty("systemInstruction");
+    });
+
     it.each(Object.entries(TRANSLATION_PRESETS))(
         "persists the %s preset and its values",
         (preset, settings) => {

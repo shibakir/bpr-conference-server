@@ -156,6 +156,7 @@ export class TranslationBridge {
             enableTranscription?: boolean;
             settings?: TranslationSettingsSnapshot;
             streamEpoch?: number;
+            systemInstruction?: string;
         },
     ) {
         this.settings = { ...(config.settings ?? DEFAULT_TRANSLATION_SETTINGS) };
@@ -183,6 +184,7 @@ export class TranslationBridge {
             enableTranscription: this.enableTranscription,
             contextCompressionTriggerTokens: this.contextCompressionTriggerTokens,
             contextCompressionTargetTokens: this.contextCompressionTargetTokens,
+            ...(config.systemInstruction ? { systemInstruction: config.systemInstruction } : {}),
             shouldReconnect: () => this.status === "active",
             onMessage: (message) => this.handleGeminiMessage(message),
             onDiscontinuity: () => {

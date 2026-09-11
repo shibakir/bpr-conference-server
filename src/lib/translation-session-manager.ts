@@ -48,6 +48,7 @@ export interface SessionInfo {
     enableAudioTranslation: boolean;
     enableTranscription: boolean;
     allowedLanguages?: string[];
+    systemInstruction?: string;
     presenterClientId?: string;
     presenterLeaseExpiresAt?: Date;
 }
@@ -154,6 +155,7 @@ class TranslationSessionManager {
             organizerKeyHash: string;
             allowedLanguages?: string[];
             durationMinutes?: number;
+            systemInstruction?: string;
         },
     ): SessionInfo {
         const createdAt = new Date();
@@ -170,6 +172,7 @@ class TranslationSessionManager {
             enableAudioTranslation: options.enableAudioTranslation,
             enableTranscription: options.enableTranscription,
             ...(options.allowedLanguages ? { allowedLanguages: options.allowedLanguages } : {}),
+            ...(options.systemInstruction ? { systemInstruction: options.systemInstruction } : {}),
         };
         this.sessions.set(sessionId, info);
         this.scheduleSessionExpiration(info);
@@ -179,6 +182,8 @@ class TranslationSessionManager {
                 durationMinutes,
                 enableAudioTranslation: options.enableAudioTranslation,
                 enableTranscription: options.enableTranscription,
+                hasSystemInstruction: !!options.systemInstruction,
+                systemInstructionLength: options.systemInstruction?.length ?? 0,
                 organizerIdentity,
                 sessionId,
             },
@@ -365,6 +370,7 @@ class TranslationSessionManager {
             enableTranscription: options.enableTranscription === true,
             settings: session.translationSettings,
             streamEpoch: ++session.nextStreamEpoch,
+            ...(session.systemInstruction ? { systemInstruction: session.systemInstruction } : {}),
         };
 
         const bridge = new TranslationBridge(sessionId, targetLanguage, organizerIdentity, config);

@@ -10,6 +10,7 @@ import {
 import { TRANSLATION_OUTPUT_MODES } from "./session-types";
 
 const apiErrorCodes = Object.values(API_ERROR_CODES) as [ApiErrorCode, ...ApiErrorCode[]];
+export const MAX_SYSTEM_INSTRUCTION_LENGTH = 4000;
 
 export const apiErrorResponseSchema = z
     .object({
@@ -34,6 +35,13 @@ const organizerNameSchema = z.preprocess(
     (value) => (typeof value === "string" && value.trim().length > 0 ? value.trim() : "organizer"),
     z.string(),
 );
+const systemInstructionSchema = z.preprocess((value) => {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value !== "string") return value;
+
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+}, z.string().max(MAX_SYSTEM_INSTRUCTION_LENGTH).optional());
 
 export const createSessionRequestSchema = z.object({
     allowedLanguages: z.array(z.string()).min(1).optional(),
@@ -44,6 +52,7 @@ export const createSessionRequestSchema = z.object({
     locale: localeSchema.optional().default(defaultLocale),
     organizerName: organizerNameSchema,
     password: z.string().optional(),
+    systemInstruction: systemInstructionSchema,
     translationOutputs: z.array(translationOutputModeSchema).optional(),
 });
 
@@ -70,9 +79,11 @@ export const createSessionFormSchema = z.object({
         .max(MAX_SESSION_DURATION_MINUTES),
     password: z.string(),
     selectedLanguages: z.array(z.string()).min(1),
+    systemInstruction: z.string().max(MAX_SYSTEM_INSTRUCTION_LENGTH).optional(),
     translationOutputs: z.array(translationOutputModeSchema).min(1, {
         message: "Select at least one option.",
     }),
+    useCustomContext: z.boolean(),
 });
 
 export type CreateSessionFormValues = z.infer<typeof createSessionFormSchema>;
