@@ -40,6 +40,21 @@ See [EC2 Docker deploy](docs/ec2-docker-deploy.md).
 
 ## Translation settings
 
+### Audio transmission quality
+
+The broadcaster client can publish its mixed microphone/tab audio with an Opus
+bitrate limit of 32, 48 (default), or 96 kbps. The choice is stored in that browser
+and can be changed while both audio sources are off. The client republishes the
+inactive track before audio resumes; the server subscribes to the replacement
+organizer track through the existing LiveKit track lifecycle handlers.
+
+All three modes use the same server pipeline: LiveKit decodes the incoming track,
+and `BoundedAudioInput` requests 16-bit mono PCM at 16 kHz for Gemini. No API field
+or server-side bitrate setting is needed. Translation delay presets, Gemini input
+format, and translated output encoding are independent of this client preference.
+
+### Translation delay presets
+
 New sessions use the `balanced` preset. The owner can read settings with
 `GET /api/sessions/:sessionId/translation-settings` and the `x-organizer-key` header.
 PATCH the same endpoint with `organizerKey`, `expectedVersion`,

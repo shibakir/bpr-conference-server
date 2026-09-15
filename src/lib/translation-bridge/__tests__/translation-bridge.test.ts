@@ -69,6 +69,34 @@ function createBridge(): TranslationBridge {
 }
 
 describe("TranslationBridge", () => {
+    it("subscribes to the replacement track after an inactive audio quality change", async () => {
+        const bridge = createBridge();
+        const internals = bridge as unknown as BridgeInternals;
+        const room = new FakeRoom();
+        const oldPublication = createPublication("standard-audio");
+        oldPublication.muted = true;
+        const organizer = createParticipant("organizer-host", [oldPublication]);
+        room.remoteParticipants.set(organizer.identity, organizer);
+        internals.room = room;
+        await internals.subscribeToOrganizer();
+        internals.activeOrganizerAudioPipelineId = oldPublication.sid;
+
+        organizer.trackPublications.delete(oldPublication.sid);
+        room.emit(RoomEvent.TrackUnpublished, oldPublication, organizer);
+        expect(internals.activeOrganizerAudioPipelineId).toBeNull();
+
+        const replacement = createPublication("high-quality-audio");
+        replacement.muted = true;
+        organizer.trackPublications.set(
+            replacement.sid,
+            replacement as unknown as RemoteTrackPublication,
+        );
+        room.emit(RoomEvent.TrackPublished, replacement, organizer);
+
+        expect(replacement.setSubscribed).toHaveBeenCalledWith(true);
+        expect(oldPublication.setSubscribed).toHaveBeenCalledTimes(1);
+    });
+
     it("subscribes to organizer audio again after control recovery reconnects the organizer", async () => {
         const bridge = createBridge();
         const bridgeInternals = bridge as unknown as BridgeInternals;
