@@ -34,6 +34,9 @@ const liveKitUrlSchema = z.preprocess(
 const serverEnvSchema = z.object({
     BROADCAST_PASSWORD: optionalSecretSchema,
     GEMINI_API_KEY: optionalSecretSchema,
+    GEMINI_WARM_HANDOVER_ENABLED: z
+        .preprocess(emptyStringAsUndefined, z.enum(["true", "false"]).default("true"))
+        .transform((value) => value === "true"),
     LIVEKIT_API_KEY: optionalSecretSchema,
     LIVEKIT_API_SECRET: optionalSecretSchema,
     LIVEKIT_URL: liveKitUrlSchema,
@@ -44,6 +47,7 @@ const serverEnvSchema = z.object({
 export const serverEnv = serverEnvSchema.parse({
     BROADCAST_PASSWORD: process.env["BROADCAST_PASSWORD"],
     GEMINI_API_KEY: process.env["GEMINI_API_KEY"],
+    GEMINI_WARM_HANDOVER_ENABLED: process.env["GEMINI_WARM_HANDOVER_ENABLED"],
     LIVEKIT_API_KEY: process.env["LIVEKIT_API_KEY"],
     LIVEKIT_API_SECRET: process.env["LIVEKIT_API_SECRET"],
     LIVEKIT_URL: process.env["LIVEKIT_URL"],

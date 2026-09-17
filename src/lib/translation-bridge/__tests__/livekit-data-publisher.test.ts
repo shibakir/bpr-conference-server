@@ -45,6 +45,47 @@ function getPublishCall(publishData: ReturnType<typeof createRoom>["publishData"
 }
 
 describe("TranslationDataPublisher", () => {
+    it("preserves the pending control when caption overflow follows a stream rotation", async () => {
+        const { room, publishData } = createRoom([]);
+        const publisher = new TranslationDataPublisher({ targetLanguage: "cs" });
+        publisher.publishControl(room, { historyRevision: 0 });
+        publisher.resetStream();
+        let sending!: Promise<void>;
+        for (let i = 0; i < 55; i++)
+            sending = publisher.publishTranscription(room, String(i), false, i);
+        await sending;
+        const payloads = publishData.mock.calls.map(([data]) =>
+            JSON.parse(new TextDecoder().decode(data)),
+        );
+        expect(payloads[0]).toMatchObject({ type: "translation-control" });
+        expect(payloads).toHaveLength(50);
+        expect(publisher.getDiagnostics().droppedCaptionSegments).toBe(6);
+    });
+    it("keeps pending controls while rotating captions and leaves historyRevision unchanged", async () => {
+        const { room, publishData } = createRoom([]);
+        const publisher = new TranslationDataPublisher({
+            targetLanguage: "cs",
+            historyRevision: 7,
+        });
+        const sending = publisher.publishTranscription(room, "unsent old", true, 1);
+        publisher.publishControl(room, { historyRevision: 7 });
+        publisher.resetStream();
+        void publisher.publishTranscription(room, "new", true, 2);
+        await sending;
+        const payloads = publishData.mock.calls.map(([data]) =>
+            JSON.parse(new TextDecoder().decode(data)),
+        );
+        expect(payloads).toHaveLength(2);
+        expect(payloads[0]).toMatchObject({
+            type: "translation-control",
+            control: { historyRevision: 7 },
+        });
+        expect(payloads[1]).toMatchObject({
+            snapshotText: "new",
+            historyRevision: 7,
+            streamGeneration: 1,
+        });
+    });
     it("broadcasts history resets to every listener, including hidden caption languages", async () => {
         const { room, publishData } = createRoom([
             { identity: "listener-cs", language: "cs" },

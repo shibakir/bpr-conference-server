@@ -62,3 +62,12 @@ The quality preset allows more speech to queue before dropping it; it does not
 change the translation model. The poor connection preset sends fewer, larger
 messages to Gemini at the cost of input waiting time. It does not repair network
 dropouts. The output queue limit excludes model processing and listener delivery.
+
+## Gemini session handover
+
+`GEMINI_WARM_HANDOVER_ENABLED=true` enables a second, independent Gemini session
+for bridges with captions. It starts after eight minutes and receives the same
+live audio for at least 30 seconds before taking over output. Caption history and
+the LiveKit participant/track are preserved. Earlier standby output is discarded.
+The flag defaults to `true` when unset or empty. Set it explicitly to `false` to
+disable warm handover. Configuration is read when the server starts.

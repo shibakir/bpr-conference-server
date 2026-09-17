@@ -11,6 +11,7 @@ const SOFT_LIMIT_HOLD_MS = 200;
 const SPEED_STEP_INTERVAL_MS = 100;
 const SPEED_STEP = 0.01;
 const MAX_PLAYBACK_SPEED = 1.15;
+class AudioCaptureTimeout extends Error {}
 
 type QueuedFrame = {
     pcm: Int16Array;
@@ -53,6 +54,7 @@ export class TranslatedAudioOutput {
     private lastSample = 0;
     private smoothNext = false;
     private generation = 0;
+    private streamRevision = 0;
     private cancelCapture: (() => void) | null = null;
     private draining = false;
     private drainOverflow = false;
@@ -97,6 +99,7 @@ export class TranslatedAudioOutput {
     }
 
     clear(): void {
+        this.streamRevision++;
         this.recordDrop(this.getTotalBacklogMs(), "stream-reset");
         this.pending = [];
         this.pendingSamples = 0;
@@ -105,6 +108,7 @@ export class TranslatedAudioOutput {
         this.clearNativeRequested = true;
         if (!this.publishing) this.clearNative();
         this.smoothNext = true;
+        this.lastSample = 0;
         this.speed = 1;
         this.highBacklogSince = null;
     }
@@ -299,7 +303,8 @@ export class TranslatedAudioOutput {
                 cancelled,
                 new Promise<never>((_, reject) => {
                     timeout = setTimeout(
-                        () => reject(new Error("LiveKit audio capture stalled for 2s")),
+                        () =>
+                            reject(new AudioCaptureTimeout("LiveKit audio capture stalled for 2s")),
                         2000,
                     );
                     timeout.unref();
@@ -361,17 +366,32 @@ export class TranslatedAudioOutput {
                     this.smoothNext = false;
                 }
                 this.inFlightMs = this.ms(pcm.length);
-                await this.captureWithTimeout(
-                    source,
-                    new AudioFrame(
-                        pcm,
-                        this.options.sampleRate,
-                        this.options.channels,
-                        pcm.length / this.options.channels,
-                    ),
-                );
+                const streamRevision = this.streamRevision;
+                try {
+                    await this.captureWithTimeout(
+                        source,
+                        new AudioFrame(
+                            pcm,
+                            this.options.sampleRate,
+                            this.options.channels,
+                            pcm.length / this.options.channels,
+                        ),
+                    );
+                } catch (error) {
+                    // A settled old capture can fail after the source switch. A timeout still
+                    // means the shared native source is stalled; never start competing captures.
+                    if (
+                        streamRevision !== this.streamRevision &&
+                        !(error instanceof AudioCaptureTimeout)
+                    ) {
+                        this.inFlightMs = 0;
+                        continue;
+                    }
+                    throw error;
+                }
                 this.inFlightMs = 0;
                 if (generation !== this.generation) break;
+                if (streamRevision !== this.streamRevision) continue;
                 this.lastSample = pcm[pcm.length - 1] ?? 0;
                 this.options.onFramePublished(queued.receivedAt, performance.now());
             }

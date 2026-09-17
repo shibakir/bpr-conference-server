@@ -33,7 +33,13 @@ import {
 import { prepareAudioTempo } from "./audio-tempo";
 import { BoundedAudioInput, type AudioInputReader } from "./bounded-audio-input";
 import { PcmPacketizer } from "./pcm-packetizer";
-import { GeminiLiveConnection, type GeminiServerMessage } from "./gemini-live-connection";
+import {
+    GeminiLiveConnection,
+    type GeminiServerMessage,
+    type GeminiLiveConnectionOptions,
+} from "./gemini-live-connection";
+import { GeminiSessionCoordinator } from "./gemini-session-coordinator";
+import { serverEnv } from "../../env/server";
 import { TranslationLatencyMetrics } from "./latency-metrics";
 import { TranslationDataPublisher } from "./livekit-data-publisher";
 import { TranslatedAudioOutput } from "./translated-audio-output";
@@ -54,6 +60,8 @@ function sanitizeGeminiDebugValue(value: unknown): unknown {
     if (value && typeof value === "object") {
         return Object.fromEntries(
             Object.entries(value).map(([key, entry]) => {
+                if (["handle", "newHandle", "resumptionHandle"].includes(key))
+                    return [key, "[redacted]"];
                 if (key === "data" && typeof entry === "string") {
                     return [key, `[redacted string length=${entry.length}]`];
                 }
@@ -145,7 +153,7 @@ export class TranslationBridge {
     private readonly livekitApiSecret: string;
     private readonly enableAudioTranslation: boolean;
     private readonly enableTranscription: boolean;
-    private readonly geminiConnection: GeminiLiveConnection;
+    private readonly geminiConnection: GeminiLiveConnection | GeminiSessionCoordinator;
     private readonly latencyMetrics: TranslationLatencyMetrics;
     private readonly dataPublisher: TranslationDataPublisher;
     private readonly translatedAudioOutput: TranslatedAudioOutput;
@@ -169,6 +177,8 @@ export class TranslationBridge {
             streamEpoch?: number;
             historyRevision?: number;
             systemInstruction?: string;
+            warmHandoverEnabled?: boolean;
+            geminiWebSocketFactory?: GeminiLiveConnectionOptions["webSocketFactory"];
         },
     ) {
         this.settings = { ...(config.settings ?? DEFAULT_TRANSLATION_SETTINGS) };
@@ -188,7 +198,11 @@ export class TranslationBridge {
             sessionId,
             targetLanguage,
         });
-        this.geminiConnection = new GeminiLiveConnection({
+        const connectionOptions: GeminiLiveConnectionOptions = {
+            sessionId,
+            ...(config.geminiWebSocketFactory
+                ? { webSocketFactory: config.geminiWebSocketFactory }
+                : {}),
             apiKey: this.geminiApiKey,
             model: this.geminiModel,
             targetLanguage,
@@ -208,7 +222,25 @@ export class TranslationBridge {
                 this.completeCurrentTranscriptionSegment();
                 this.dataPublisher.resetStream();
             },
-        });
+        };
+        this.geminiConnection =
+            (config.warmHandoverEnabled ?? serverEnv.GEMINI_WARM_HANDOVER_ENABLED) &&
+            this.enableTranscription
+                ? new GeminiSessionCoordinator({
+                      ...connectionOptions,
+                      sessionId,
+                      onHandover: () => {
+                          const discardedPendingCaptionChars = this.pendingInterimText.length;
+                          if (this.interimTimeout) clearTimeout(this.interimTimeout);
+                          this.interimTimeout = null;
+                          this.pendingInterimText = "";
+                          this.completeCurrentTranscriptionSegment();
+                          this.dataPublisher.resetStream();
+                          this.translatedAudioOutput.clear();
+                          return { discardedPendingCaptionChars };
+                      },
+                  })
+                : new GeminiLiveConnection(connectionOptions);
         this.dataPublisher = new TranslationDataPublisher({
             targetLanguage,
             streamEpoch: config.streamEpoch ?? 0,
@@ -262,6 +294,8 @@ export class TranslationBridge {
             throw new TranslationControlError("stopped");
         const controller = new AbortController();
         this.operationAbort = controller;
+        if (this.geminiConnection instanceof GeminiSessionCoordinator)
+            this.geminiConnection.pauseHandover();
         const { signal } = controller;
         const timeout = setTimeout(
             () => controller.abort(new TranslationControlError("timeout")),
@@ -370,6 +404,8 @@ export class TranslationBridge {
                 );
             }
             if (this.operationAbort === controller) this.operationAbort = null;
+            if (this.geminiConnection instanceof GeminiSessionCoordinator)
+                this.geminiConnection.resumeHandover();
         }
     }
 
@@ -454,6 +490,9 @@ export class TranslationBridge {
             this.room = null;
             room?.removeAllListeners();
             const results = await Promise.allSettled([
+                this.geminiConnection instanceof GeminiSessionCoordinator
+                    ? this.geminiConnection.waitForRetired()
+                    : undefined,
                 reader?.cancel(),
                 room?.disconnect(),
                 this.translatedAudioOutput.close(),
@@ -708,6 +747,7 @@ export class TranslationBridge {
                     );
                     this.pendingInterimText = "";
                     this.transcriptionSegmentHasText = true;
+                    this.markHandoverTextQueued();
                 } else if (this.transcriptionSegmentHasText && !publishedFinalTranscription) {
                     void this.dataPublisher.publishTranscription(
                         this.room,
@@ -1068,6 +1108,7 @@ export class TranslationBridge {
             false,
             this.transcriptionSegmentId,
         );
+        this.markHandoverTextQueued();
         return true;
     }
 
@@ -1087,6 +1128,12 @@ export class TranslationBridge {
                 this.transcriptionSegmentId,
             );
             this.pendingInterimText = "";
+            this.markHandoverTextQueued();
         }
+    }
+
+    private markHandoverTextQueued(): void {
+        if (this.geminiConnection instanceof GeminiSessionCoordinator)
+            this.geminiConnection.markTextQueued();
     }
 }

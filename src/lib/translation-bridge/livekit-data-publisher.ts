@@ -107,7 +107,9 @@ export class TranslationDataPublisher {
         this.text = "";
         this.revision = 0;
         this.final = false;
-        this.pending.clear();
+        for (const [key, item] of this.pending) {
+            if (item.snapshot.type === "transcription") this.pending.delete(key);
+        }
     }
 
     stop(): void {
@@ -184,7 +186,10 @@ export class TranslationDataPublisher {
         };
         this.pending.set(segmentId, { room, snapshot });
         if (this.pending.size > MAX_PENDING_SEGMENTS) {
-            this.pending.delete(this.pending.keys().next().value!);
+            const oldestCaption = [...this.pending].find(
+                ([, item]) => item.snapshot.type === "transcription",
+            );
+            if (oldestCaption) this.pending.delete(oldestCaption[0]);
             this.droppedCaptionSegments++;
             this.log.warn("Slow caption delivery: discarded oldest pending segment");
         }

@@ -46,6 +46,13 @@ export type GeminiLiveConnectionOptions = {
     onMessage: (message: GeminiServerMessage) => void;
     webSocketFactory?: (url: string) => WebSocket;
     onDiscontinuity?: () => void;
+    // When supplied, only the coordinator may open replacement sockets.
+    onRecoveryRequested?: (reason: string, fresh: boolean) => void;
+    onReady?: () => void;
+    sessionId?: string;
+    connectionId?: string;
+    setupTimeoutMs?: number;
+    closeGraceMs?: number;
 };
 
 type GeminiSetup = {
@@ -110,18 +117,25 @@ export class GeminiLiveConnection {
     private lifecycleRevision = 0;
     private connectionRevision = 0;
     private readonly log;
+    private readonly retiring = new Set<Promise<void>>();
 
     constructor(private readonly options: GeminiLiveConnectionOptions) {
         this.log = createLogger({
             component: "gemini-live-connection",
             targetLanguage: options.targetLanguage,
+            sessionId: options.sessionId,
+            connectionId: options.connectionId,
         });
     }
 
     async connect(): Promise<void> {
         if (this.isStopped) throw new Error("Gemini connection stopped");
+        const revision = this.lifecycleRevision;
         const attempts = this.getResponseModalityAttempts();
         for (let index = 0; index < attempts.length; index++) {
+            if (this.retiring.size) await this.waitForRetired();
+            if (this.isStopped || revision !== this.lifecycleRevision)
+                throw new Error("Gemini connection stopped");
             const modalities = attempts[index];
             if (!modalities) continue;
             this.responseModalities = modalities;
@@ -131,6 +145,7 @@ export class GeminiLiveConnection {
             } catch (error) {
                 if (
                     this.isStopped ||
+                    revision !== this.lifecycleRevision ||
                     index === attempts.length - 1 ||
                     !this.shouldRetryWithNextResponseModality(error)
                 )
@@ -154,7 +169,10 @@ export class GeminiLiveConnection {
             this.pendingSocket = socket;
             let acknowledged = false;
             let settled = false;
-            const timeout = setTimeout(() => fail(new Error("Gemini setup timeout")), 15_000);
+            const timeout = setTimeout(
+                () => fail(new Error("Gemini setup timeout")),
+                this.options.setupTimeoutMs ?? 15_000,
+            );
             const settle = () => {
                 settled = true;
                 clearTimeout(timeout);
@@ -195,6 +213,7 @@ export class GeminiLiveConnection {
                         settle();
                         if (old && old !== socket) this.retireSocket(old);
                         resolve();
+                        this.options.onReady?.();
                         return;
                     }
                     // Candidate/retired sockets must never publish translated output.
@@ -250,8 +269,13 @@ export class GeminiLiveConnection {
         return this.connectionRevision;
     }
 
+    get socketCount(): number {
+        return Number(this.ws !== null) + Number(this.pendingSocket !== null) + this.retiring.size;
+    }
+
     /** Owner reset has explicit completion and does not share the automatic recovery limiter. */
     async resetFresh(): Promise<void> {
+        if (this.options.onRecoveryRequested) return this.recoverManaged(true);
         if (!this.canReconnect()) throw new Error("Gemini connection stopped");
         this.lifecycleRevision++;
         if (this.retryTimer) clearTimeout(this.retryTimer);
@@ -276,6 +300,32 @@ export class GeminiLiveConnection {
             this.scheduleReconnect();
             throw error;
         }
+    }
+
+    /** Called only by the coordinator, after it has retired any standby. */
+    async recoverManaged(fresh: boolean, waitForSlot?: () => Promise<void>): Promise<void> {
+        if (!this.canReconnect()) throw new Error("Gemini connection stopped");
+        const revision = ++this.lifecycleRevision;
+        this.cancelPending?.();
+        const socket = this.ws;
+        this.ws = null;
+        this.setupComplete = false;
+        if (socket) this.retireSocket(socket);
+        this.congestionSince = null;
+        this.resetVoiceWatchdog();
+        if (fresh) {
+            this.resumptionHandle = null;
+            this.resetCount++;
+            this.options.onDiscontinuity?.();
+        }
+        await Promise.all([this.waitForRetired(), waitForSlot?.()]);
+        if (!this.canReconnect() || revision !== this.lifecycleRevision)
+            throw new Error("Gemini connection stopped");
+        await this.connect();
+    }
+
+    async waitForRetired(): Promise<void> {
+        await Promise.all(this.retiring);
     }
 
     endAudioInput(): boolean {
@@ -369,6 +419,10 @@ export class GeminiLiveConnection {
         )
             return;
         this.freshRestarts.push(now);
+        if (this.options.onRecoveryRequested) {
+            this.options.onRecoveryRequested(reason, true);
+            return;
+        }
         this.log.warn({ reason }, "Restarting Gemini with fresh context");
         this.resetVoiceWatchdog();
         this.resumptionHandle = null;
@@ -412,12 +466,37 @@ export class GeminiLiveConnection {
         socket.removeAllListeners();
         // Closing a CONNECTING ws emits an asynchronous error in the ws library.
         socket.on("error", () => {});
+        if (this.options.onRecoveryRequested && socket.readyState !== WebSocket.CLOSED) {
+            let done!: () => void;
+            const closed = new Promise<void>((resolve) => {
+                done = resolve;
+            });
+            this.retiring.add(closed);
+            const finish = () => {
+                clearTimeout(timeout);
+                socket.removeListener("close", finish);
+                this.retiring.delete(closed);
+                done();
+            };
+            const timeout = setTimeout(() => {
+                socket.terminate();
+                finish();
+            }, this.options.closeGraceMs ?? 1000);
+            socket.once("close", finish);
+            // Discard queued old audio immediately; await close before reusing its slot.
+            socket.terminate();
+            return;
+        }
         if (socket.readyState === WebSocket.CONNECTING) socket.terminate();
         else if (socket.readyState !== WebSocket.CLOSED) socket.close();
     }
 
     private scheduleReconnect(): void {
         if (!this.canReconnect() || this.pendingSocket || this.retryTimer) return;
+        if (this.options.onRecoveryRequested) {
+            this.options.onRecoveryRequested("transport_closed", false);
+            return;
+        }
         const baseMs = Math.min(500 * 2 ** Math.min(this.retryAttempt++, 6), 30_000);
         const delayMs = Math.round(baseMs * (1 + Math.random() * 0.2));
         this.retryTimer = setTimeout(() => {
@@ -447,7 +526,7 @@ export class GeminiLiveConnection {
             this.resetVoiceWatchdog();
         const update = message.sessionResumptionUpdate;
         if (update?.resumable && update.newHandle) this.resumptionHandle = update.newHandle;
-        if (message.goAway) this.reconnect();
+        if (message.goAway && !this.options.onRecoveryRequested) this.reconnect();
         this.options.onMessage(message);
     }
 
@@ -507,7 +586,16 @@ export class GeminiLiveConnection {
               }
             : setupMessage;
         this.log.info(
-            { resuming: !!this.resumptionHandle, setup: loggedSetupMessage },
+            {
+                resuming: !!this.resumptionHandle,
+                setup: {
+                    ...loggedSetupMessage,
+                    setup: {
+                        ...loggedSetupMessage.setup,
+                        sessionResumption: this.resumptionHandle ? { handle: "[redacted]" } : {},
+                    },
+                },
+            },
             "Sending Gemini setup",
         );
         ws.send(JSON.stringify(setupMessage));

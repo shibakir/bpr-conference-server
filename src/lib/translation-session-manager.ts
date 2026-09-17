@@ -1,6 +1,6 @@
 /**
- * TranslationSessionManager: Singleton that enforces "max 1 Gemini Live API
- * session per language per room" constraint.
+ * TranslationSessionManager: Singleton that enforces one public translation
+ * bridge per language per room. A bridge may warm a second Gemini connection.
  *
  * Usage:
  *   const manager = TranslationSessionManager.getInstance();
