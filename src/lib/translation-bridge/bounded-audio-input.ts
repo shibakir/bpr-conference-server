@@ -41,6 +41,7 @@ export class BoundedAudioInput implements AudioInputReader {
     private waiting: ((value: ReadableStreamReadResult<AudioFrame>) => void) | null = null;
     private readonly arrivalTimes = new WeakMap<AudioFrame, number>();
     private readonly source: NativeSource;
+    private delivered: QueuedInput | null = null;
 
     constructor(
         track: RemoteAudioTrack,
@@ -61,10 +62,12 @@ export class BoundedAudioInput implements AudioInputReader {
     }
 
     read(): Promise<ReadableStreamReadResult<AudioFrame>> {
+        this.delivered = null;
         this.trim();
         const queued = this.pending.shift();
         if (queued) {
             this.pendingMs -= queued.durationMs;
+            this.delivered = queued;
             return Promise.resolve({ done: false, value: queued.frame });
         }
         if (this.ended) return Promise.resolve({ done: true, value: undefined });
@@ -81,6 +84,21 @@ export class BoundedAudioInput implements AudioInputReader {
         this.source.cancel();
         this.finish();
     }
+
+    /** Include a frame already resolved to the read loop but not yet consumed. */
+    takeBuffered(): QueuedInput[] {
+        const buffered = [...(this.delivered ? [this.delivered] : []), ...this.pending];
+        this.delivered = null;
+        this.pending = [];
+        this.pendingMs = 0;
+        return buffered;
+    }
+
+    consume(frame: AudioFrame): boolean {
+        if (this.delivered?.frame !== frame) return false;
+        this.delivered = null;
+        return true;
+    }
     releaseLock(): void {
         /* Ownership belongs to this single consumer until cancel/EOS. */
     }
@@ -96,6 +114,7 @@ export class BoundedAudioInput implements AudioInputReader {
         const queued = this.waiting ? this.pending.shift() : undefined;
         if (queued) {
             this.pendingMs -= queued.durationMs;
+            this.delivered = queued;
             const resolve = this.waiting!;
             this.waiting = null;
             resolve({ done: false, value: queued.frame });

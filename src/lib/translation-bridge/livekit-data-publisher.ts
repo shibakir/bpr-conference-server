@@ -4,10 +4,13 @@ import type { Room } from "@livekit/rtc-node";
 
 import { createLogger } from "../logger";
 import { participantWantsTranslation } from "./participant-attributes";
+import { TranslationControlError, type TranslationControl } from "../translation-control";
+import { waitUntil } from "./operation-wait";
 
 export type TranslationDataPublisherOptions = {
     targetLanguage: string;
     streamEpoch?: number;
+    historyRevision?: number;
     onPublicationError?: () => void;
 };
 
@@ -26,11 +29,17 @@ type Snapshot = {
     segmentId: string;
     revision: number;
     language: string;
+    historyRevision: number;
     // Legacy consumers still receive a delta. Version 2 consumers use snapshotText.
     text: string;
     snapshotText: string;
     final: boolean;
     timestamp: number;
+};
+type ControlMessage = {
+    type: "translation-control";
+    language: string;
+    control: TranslationControl;
 };
 
 /** Bounded, coalescing text delivery; audio never waits for a data channel write. */
@@ -44,18 +53,44 @@ export class TranslationDataPublisher {
     private revision = 0;
     private text = "";
     private final = false;
-    private pending = new Map<string, { room: Room; snapshot: Snapshot }>();
+    private pending = new Map<string, { room: Room; snapshot: Snapshot | ControlMessage }>();
     private sending: Promise<void> | null = null;
     private stopped = false;
     private cancelWrite: (() => void) | null = null;
     private droppedCaptionSegments = 0;
     private failedCaptionUpdates = 0;
+    private historyRevision: number;
 
     constructor(private readonly options: TranslationDataPublisherOptions) {
+        this.historyRevision = options.historyRevision ?? 0;
         this.log = createLogger({
             component: "translation-data-publisher",
             targetLanguage: options.targetLanguage,
         });
+    }
+
+    setHistoryRevision(revision: number): void {
+        this.historyRevision = revision;
+    }
+
+    publishControl(room: Room | null, control: TranslationControl): void {
+        if (this.stopped || !room?.localParticipant) return;
+        this.pending.set("control", {
+            room,
+            snapshot: {
+                type: "translation-control",
+                language: this.options.targetLanguage,
+                control,
+            },
+        });
+        if (!this.sending) this.sending = Promise.resolve().then(() => this.drain());
+    }
+
+    async waitForIdle(signal: AbortSignal): Promise<void> {
+        await waitUntil(() => {
+            if (this.stopped) throw new TranslationControlError("publication_failed");
+            return !this.sending && !this.pending.size;
+        }, signal);
     }
 
     getDiagnostics() {
@@ -140,7 +175,9 @@ export class TranslationDataPublisher {
             segmentId,
             revision: ++this.revision,
             language: this.options.targetLanguage,
-            text: (previous?.snapshot.text ?? "") + delta,
+            text:
+                (previous?.snapshot.type === "transcription" ? previous.snapshot.text : "") + delta,
+            historyRevision: this.historyRevision,
             snapshotText: this.text,
             final: this.final,
             timestamp: Date.now(),
@@ -177,8 +214,11 @@ export class TranslationDataPublisher {
                         new TextEncoder().encode(JSON.stringify(snapshot)),
                         {
                             reliable: true,
-                            topic: "transcription",
-                            ...(destinationIdentities.length
+                            topic:
+                                snapshot.type === "transcription"
+                                    ? "transcription"
+                                    : "translation-control",
+                            ...(snapshot.type === "transcription" && destinationIdentities.length
                                 ? { destination_identities: destinationIdentities }
                                 : {}),
                         },
@@ -195,6 +235,8 @@ export class TranslationDataPublisher {
                         }),
                     ]);
                 } catch (error) {
+                    if (snapshot.type === "transcription" && snapshot.streamId !== this.streamId)
+                        continue;
                     this.failedCaptionUpdates++;
                     this.log.error({ err: error }, "Error publishing transcription");
                     this.stop();

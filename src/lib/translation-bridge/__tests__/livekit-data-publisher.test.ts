@@ -45,6 +45,60 @@ function getPublishCall(publishData: ReturnType<typeof createRoom>["publishData"
 }
 
 describe("TranslationDataPublisher", () => {
+    it("broadcasts history resets to every listener, including hidden caption languages", async () => {
+        const { room, publishData } = createRoom([
+            { identity: "listener-cs", language: "cs" },
+            { identity: "listener-de", language: "de" },
+        ]);
+        const publisher = new TranslationDataPublisher({ targetLanguage: "cs" });
+        publisher.setHistoryRevision(1);
+        publisher.resetStream();
+        publisher.publishControl(room, { historyRevision: 1 });
+        await publisher.waitForIdle(new AbortController().signal);
+        await publisher.publishTranscription(room, "new", true, 1);
+        const [encoded, options] = getPublishCall(publishData);
+        expect(JSON.parse(new TextDecoder().decode(encoded))).toMatchObject({
+            type: "translation-control",
+            language: "cs",
+            control: { historyRevision: 1 },
+        });
+        expect(options).toEqual({ reliable: true, topic: "translation-control" });
+        expect(JSON.parse(new TextDecoder().decode(publishData.mock.calls[1]![0]))).toMatchObject({
+            historyRevision: 1,
+            snapshotText: "new",
+        });
+    });
+
+    it("ignores a retired write failure and delivers the replacement stream", async () => {
+        const { room, publishData } = createRoom([]);
+        let rejectOld!: (reason: Error) => void;
+        publishData.mockImplementationOnce(
+            () =>
+                new Promise((_, reject) => {
+                    rejectOld = reject;
+                }),
+        );
+        const onPublicationError = vi.fn();
+        const publisher = new TranslationDataPublisher({
+            targetLanguage: "cs",
+            onPublicationError,
+        });
+        const sending = publisher.publishTranscription(room, "old", true, 1);
+        await Promise.resolve();
+        publisher.setHistoryRevision(1);
+        publisher.resetStream();
+        publisher.publishControl(room, { historyRevision: 1 });
+        void publisher.publishTranscription(room, "new", true, 1);
+        rejectOld(new Error("retired transport"));
+        await sending;
+        expect(onPublicationError).not.toHaveBeenCalled();
+        expect(publishData).toHaveBeenCalledTimes(3);
+        expect(JSON.parse(new TextDecoder().decode(publishData.mock.calls[2]![0]))).toMatchObject({
+            historyRevision: 1,
+            snapshotText: "new",
+        });
+    });
+
     it("sends a final transcription only to listeners of the target language", async () => {
         const { room, publishData } = createRoom([
             { identity: "listener-cs", language: "cs" },

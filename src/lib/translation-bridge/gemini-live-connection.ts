@@ -27,6 +27,8 @@ export type GeminiServerMessage = {
         };
         outputTranscription?: GeminiTranscription;
         turnComplete?: boolean;
+        generationComplete?: boolean;
+        interrupted?: boolean;
     };
     outputTranscription?: GeminiTranscription;
 };
@@ -105,6 +107,8 @@ export class GeminiLiveConnection {
     private resumptionHandle: string | null = null;
     private isStopped = false;
     private responseModalities: string[] = ["AUDIO"];
+    private lifecycleRevision = 0;
+    private connectionRevision = 0;
     private readonly log;
 
     constructor(private readonly options: GeminiLiveConnectionOptions) {
@@ -185,6 +189,7 @@ export class GeminiLiveConnection {
                         acknowledged = true;
                         const old = this.ws;
                         this.ws = socket;
+                        this.connectionRevision++;
                         this.setupComplete = true;
                         this.retryAttempt = 0;
                         settle();
@@ -239,6 +244,56 @@ export class GeminiLiveConnection {
 
     get isReady(): boolean {
         return !this.isStopped && this.ws?.readyState === WebSocket.OPEN && this.setupComplete;
+    }
+
+    get revision(): number {
+        return this.connectionRevision;
+    }
+
+    /** Owner reset has explicit completion and does not share the automatic recovery limiter. */
+    async resetFresh(): Promise<void> {
+        if (!this.canReconnect()) throw new Error("Gemini connection stopped");
+        this.lifecycleRevision++;
+        if (this.retryTimer) clearTimeout(this.retryTimer);
+        this.retryTimer = null;
+        this.cancelPending?.();
+        const socket = this.ws;
+        this.ws = null;
+        this.setupComplete = false;
+        if (socket) {
+            socket.removeAllListeners();
+            socket.on("error", () => {});
+            socket.terminate();
+        }
+        this.resumptionHandle = null;
+        this.congestionSince = null;
+        this.resetVoiceWatchdog();
+        this.resetCount++;
+        this.options.onDiscontinuity?.();
+        try {
+            await this.connectOnce();
+        } catch (error) {
+            this.scheduleReconnect();
+            throw error;
+        }
+    }
+
+    endAudioInput(): boolean {
+        if (!this.isReady || !this.ws) return false;
+        const socket = this.ws;
+        try {
+            socket.send(
+                JSON.stringify({ realtimeInput: { audioStreamEnd: true } }),
+                (error?: Error) => {
+                    if (error && this.ws === socket && !this.isStopped)
+                        this.restartFresh("send-error");
+                },
+            );
+            return true;
+        } catch {
+            this.restartFresh("send-error");
+            return false;
+        }
     }
 
     get isRecovering(): boolean {
@@ -373,8 +428,9 @@ export class GeminiLiveConnection {
 
     private reconnect(): void {
         if (!this.canReconnect() || this.pendingSocket || this.retryTimer) return;
+        const revision = this.lifecycleRevision;
         void this.connectOnce().catch((error) => {
-            if (!this.canReconnect()) return;
+            if (!this.canReconnect() || revision !== this.lifecycleRevision) return;
             this.log.warn({ err: error }, "Gemini reconnect failed");
             this.scheduleReconnect();
         });

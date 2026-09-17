@@ -5,6 +5,11 @@ import { AccessToken } from "livekit-server-sdk";
 import type { z } from "zod";
 
 import { updateTranslationSettingsSchema } from "./lib/translation-settings";
+import {
+    TranslationActionRequestError,
+    translationControlRequestSchema,
+    type TranslationAction,
+} from "./lib/translation-control";
 
 import type { Locale } from "./i18n/locales";
 import { API_ERROR_CODES, apiError } from "./lib/api-errors";
@@ -650,7 +655,61 @@ export class TranslationApiService implements OnApplicationShutdown {
 
         return {
             translations: this.manager.getActiveTranslations(parsed.data.sessionId),
+            controls: this.manager.getTranslationControls(parsed.data.sessionId),
         };
+    }
+
+    startTranslationAction(
+        sessionId: string,
+        language: string,
+        action: TranslationAction,
+        body: unknown,
+    ) {
+        const parsed = translationControlRequestSchema.safeParse(body);
+        if (!parsed.success)
+            return throwApiError(
+                400,
+                API_ERROR_CODES.INVALID_REQUEST,
+                "Invalid translation operation",
+                zodErrorDetails(parsed.error),
+            );
+        this.requireTranslationSettingsOwner(sessionId, parsed.data.organizerKey);
+        const normalized = getLanguageByCode(language)?.code;
+        if (!normalized)
+            return throwApiError(
+                400,
+                API_ERROR_CODES.UNSUPPORTED_TARGET_LANGUAGE,
+                "Unsupported target language",
+            );
+        try {
+            return {
+                operation: this.manager.startTranslationAction(
+                    sessionId,
+                    normalized,
+                    action,
+                    parsed.data.requestId,
+                ),
+            };
+        } catch (error) {
+            if (!(error instanceof TranslationActionRequestError)) throw error;
+            if (error.code === "inactive")
+                return throwApiError(
+                    409,
+                    API_ERROR_CODES.TRANSLATION_INACTIVE,
+                    "Translation is not active",
+                );
+            if (error.code === "rate_limited")
+                return throwApiError(
+                    429,
+                    API_ERROR_CODES.TRANSLATION_OPERATION_RATE_LIMITED,
+                    "Wait before starting another translation operation",
+                );
+            return throwApiError(
+                409,
+                API_ERROR_CODES.TRANSLATION_OPERATION_CONFLICT,
+                "Another translation operation is in progress or request id was reused",
+            );
+        }
     }
 
     async onApplicationShutdown(signal?: string) {

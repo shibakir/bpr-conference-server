@@ -235,6 +235,40 @@ describe("GeminiLiveConnection", () => {
 describe("Gemini connection cancellation", () => {
     afterEach(() => vi.useRealTimers());
 
+    it("manual reset cancels a pending handover, ignores the old socket and awaits fresh setup", async () => {
+        const first = new FakeWebSocket();
+        const candidate = new FakeWebSocket();
+        const fresh = new FakeWebSocket();
+        const discontinuity = vi.fn();
+        const { connection, onMessage } = createConnection([first, candidate, fresh], {
+            onDiscontinuity: discontinuity,
+        });
+        const start = connection.connect();
+        first.open();
+        first.receive({ setupComplete: {} });
+        await start;
+        first.receive({ sessionResumptionUpdate: { resumable: true, newHandle: "old-handle" } });
+        first.receive({ goAway: {} });
+        const reset = connection.resetFresh();
+        expect(connection.isReady).toBe(false);
+        expect(first.terminate).toHaveBeenCalledOnce();
+        expect(candidate.terminate).toHaveBeenCalledOnce();
+        fresh.open();
+        expect(parseSentPayload<GeminiSetupPayload>(fresh, 0).setup.sessionResumption).toEqual({});
+        onMessage.mockClear();
+        first.receive({ serverContent: { turnComplete: true } });
+        candidate.receive({ setupComplete: {} });
+        expect(onMessage).not.toHaveBeenCalled();
+        fresh.receive({ setupComplete: {} });
+        await reset;
+        expect(connection.isReady).toBe(true);
+        expect(discontinuity).toHaveBeenCalledOnce();
+        expect(connection.endAudioInput()).toBe(true);
+        expect(parseSentPayload(fresh, 1)).toEqual({ realtimeInput: { audioStreamEnd: true } });
+        connection.stop();
+        expect(connection.endAudioInput()).toBe(false);
+    });
+
     it("cancels pending setup and ignores a late acknowledgement after stop", async () => {
         const socket = new FakeWebSocket();
         const { connection, onMessage } = createConnection([socket]);

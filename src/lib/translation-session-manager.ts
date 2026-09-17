@@ -28,6 +28,14 @@ import {
     type TranslationSettingsSnapshot,
 } from "./translation-settings";
 import { participantWantsTranslation } from "./translation-bridge/participant-attributes";
+import {
+    operationIsRunning,
+    TranslationActionRequestError,
+    TranslationControlError,
+    type TranslationAction,
+    type TranslationControl,
+    type TranslationOperation,
+} from "./translation-control";
 
 export interface TranslationInfo {
     language: string;
@@ -42,6 +50,7 @@ export interface SessionInfo {
     organizerKeyHash: string;
     translationSettings: TranslationSettingsSnapshot;
     nextStreamEpoch: number;
+    translationControls: Record<string, TranslationControl>;
     createdAt: Date;
     durationMinutes: number;
     expiresAt: Date;
@@ -121,6 +130,10 @@ class TranslationSessionManager {
     // Map<sessionId, SessionInfo>
     private sessions: Map<string, SessionInfo> = new Map();
     private bridgeStarts = new WeakMap<TranslationBridge, Promise<void>>();
+    private controlRequests = new WeakMap<
+        SessionInfo,
+        Map<string, { language: string; operation: TranslationOperation }>
+    >();
 
     private sessionExpirationTimers: Map<string, NodeJS.Timeout> = new Map();
     private roomServiceClient: RoomServiceClient | null = null;
@@ -166,6 +179,7 @@ class TranslationSessionManager {
             organizerKeyHash: options.organizerKeyHash,
             translationSettings: { ...DEFAULT_TRANSLATION_SETTINGS },
             nextStreamEpoch: 0,
+            translationControls: {},
             createdAt,
             durationMinutes,
             expiresAt: new Date(createdAt.getTime() + durationMinutes * 60_000),
@@ -370,6 +384,7 @@ class TranslationSessionManager {
             enableTranscription: options.enableTranscription === true,
             settings: session.translationSettings,
             streamEpoch: ++session.nextStreamEpoch,
+            historyRevision: session.translationControls[targetLanguage]?.historyRevision ?? 0,
             ...(session.systemInstruction ? { systemInstruction: session.systemInstruction } : {}),
         };
 
@@ -471,6 +486,96 @@ class TranslationSessionManager {
             });
         }
         return result;
+    }
+
+    getTranslationControls(sessionId: string): Record<string, TranslationControl> {
+        return structuredClone(this.getSession(sessionId)?.translationControls ?? {});
+    }
+
+    startTranslationAction(
+        sessionId: string,
+        language: string,
+        action: TranslationAction,
+        requestId: string,
+    ): TranslationOperation {
+        const session = this.getSession(sessionId);
+        if (!session) throw new TranslationActionRequestError("inactive");
+        let requests = this.controlRequests.get(session);
+        if (!requests) {
+            requests = new Map();
+            this.controlRequests.set(session, requests);
+        }
+        for (const [id, entry] of requests) {
+            if (
+                !operationIsRunning(entry.operation) &&
+                Date.now() - entry.operation.startedAt > 300_000
+            )
+                requests.delete(id);
+        }
+        const previous = requests.get(requestId);
+        if (previous) {
+            if (previous.language !== language || previous.operation.action !== action)
+                throw new TranslationActionRequestError("conflict");
+            return { ...previous.operation };
+        }
+        const bridge = this.translations.get(sessionId)?.get(language);
+        if (!bridge || bridge.status !== "active")
+            throw new TranslationActionRequestError("inactive");
+        const current = session.translationControls[language];
+        if (operationIsRunning(current?.operation))
+            throw new TranslationActionRequestError("conflict");
+        if (current?.operation && Date.now() - current.operation.startedAt < 5000)
+            throw new TranslationActionRequestError("rate_limited");
+        const operation: TranslationOperation = {
+            id: requestId,
+            action,
+            state: action === "reset" ? "resetting" : "draining",
+            startedAt: Date.now(),
+        };
+        const control: TranslationControl = {
+            historyRevision: (current?.historyRevision ?? 0) + (action === "reset" ? 1 : 0),
+            operation,
+        };
+        session.translationControls[language] = control;
+        requests.set(requestId, { language, operation });
+        if (requests.size > 256) {
+            for (const [id, entry] of requests) {
+                if (requests.size <= 256) break;
+                if (!operationIsRunning(entry.operation)) requests.delete(id);
+            }
+        }
+        const finish = (outcome: "completed" | "unconfirmed", error?: unknown) => {
+            const stillCurrent =
+                this.sessions.get(sessionId) === session &&
+                this.translations.get(sessionId)?.get(language) === bridge;
+            operation.state = error || !stillCurrent ? "failed" : outcome;
+            operation.finishedAt = Date.now();
+            if (error || !stillCurrent)
+                operation.error = !stillCurrent
+                    ? "stopped"
+                    : error instanceof TranslationControlError
+                      ? error.code
+                      : "connection_unavailable";
+            if (stillCurrent) bridge.publishControl(structuredClone(control));
+            log.info(
+                {
+                    sessionId,
+                    language,
+                    action,
+                    operationId: requestId,
+                    state: operation.state,
+                    error: operation.error,
+                },
+                "Translation operation finished",
+            );
+        };
+        const running = bridge.executeAction(action, control.historyRevision);
+        bridge.publishControl(structuredClone(control));
+        void running.then(
+            (outcome) => finish(outcome),
+            (error: unknown) => finish("completed", error),
+        );
+        return { ...operation };
     }
 
     /**

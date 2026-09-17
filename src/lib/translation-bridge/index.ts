@@ -37,6 +37,12 @@ import { GeminiLiveConnection, type GeminiServerMessage } from "./gemini-live-co
 import { TranslationLatencyMetrics } from "./latency-metrics";
 import { TranslationDataPublisher } from "./livekit-data-publisher";
 import { TranslatedAudioOutput } from "./translated-audio-output";
+import {
+    TranslationControlError,
+    type TranslationAction,
+    type TranslationControl,
+} from "../translation-control";
+import { waitUntil, withOperationSignal } from "./operation-wait";
 
 export type BridgeStatus = "starting" | "active" | "error" | "closed";
 
@@ -103,6 +109,11 @@ export class TranslationBridge {
     private transcriptionSegmentHasText = false;
     private interimTimeout: NodeJS.Timeout | null = null;
     private geminiDebugMessageCount = 0;
+    private operationAbort: AbortController | null = null;
+    private drainComplete = false;
+    private drainInterrupted = false;
+    private drainInProgress = false;
+    private lastOutputAt = 0;
 
     public readonly targetLanguage: string;
     public readonly sessionId: string;
@@ -156,6 +167,7 @@ export class TranslationBridge {
             enableTranscription?: boolean;
             settings?: TranslationSettingsSnapshot;
             streamEpoch?: number;
+            historyRevision?: number;
             systemInstruction?: string;
         },
     ) {
@@ -200,6 +212,7 @@ export class TranslationBridge {
         this.dataPublisher = new TranslationDataPublisher({
             targetLanguage,
             streamEpoch: config.streamEpoch ?? 0,
+            historyRevision: config.historyRevision ?? 0,
             onPublicationError: () => {
                 void this.stop();
             },
@@ -235,6 +248,129 @@ export class TranslationBridge {
                 );
             },
         });
+    }
+
+    publishControl(control: TranslationControl): void {
+        this.dataPublisher.publishControl(this.room, control);
+    }
+
+    async executeAction(
+        action: TranslationAction,
+        historyRevision: number,
+    ): Promise<"completed" | "unconfirmed"> {
+        if (this.status !== "active" || this.operationAbort)
+            throw new TranslationControlError("stopped");
+        const controller = new AbortController();
+        this.operationAbort = controller;
+        const { signal } = controller;
+        const timeout = setTimeout(
+            () => controller.abort(new TranslationControlError("timeout")),
+            15_000,
+        );
+        const reader = this.organizerAudioReader;
+        let outcome: "completed" | "unconfirmed" = "completed";
+        try {
+            const buffered = reader instanceof BoundedAudioInput ? reader.takeBuffered() : [];
+            if (action === "reset") {
+                this.geminiConnection.recordDroppedInput(
+                    buffered.reduce((sum, item) => sum + item.durationMs, 0),
+                );
+                this.dataPublisher.setHistoryRevision(historyRevision);
+                const connecting = this.geminiConnection.resetFresh();
+                await Promise.all([
+                    withOperationSignal(connecting, signal),
+                    this.translatedAudioOutput.clearAndWait(signal),
+                ]);
+            } else {
+                if (!this.geminiConnection.isReady || this.geminiConnection.isRecovering)
+                    throw new TranslationControlError("connection_unavailable");
+                const revision = this.geminiConnection.revision;
+                const inputDrops = this.geminiConnection.getInputDiagnostics().droppedInputMs;
+                const captionDrops = this.dataPublisher.getDiagnostics().droppedCaptionSegments;
+                this.translatedAudioOutput.beginDrain();
+                this.drainInProgress = true;
+                this.drainComplete = false;
+                this.drainInterrupted = false;
+                for (const item of buffered) this.sendAudioToGemini(item.frame, item.receivedAt);
+                this.packetizer.flush((pcm) => {
+                    if (
+                        !this.geminiConnection.sendAudio(
+                            pcm.toString("base64"),
+                            this.inputSampleRate,
+                        )
+                    )
+                        throw new TranslationControlError("interrupted");
+                });
+                if (this.geminiConnection.getInputDiagnostics().droppedInputMs !== inputDrops)
+                    throw new TranslationControlError("interrupted");
+                if (this.interimTimeout) clearTimeout(this.interimTimeout);
+                this.flushInterimTranscription();
+                // Continuous translation may hold acoustic lookahead. Feed silence, never new
+                // speech, before ending input. It is not proof that every word was translated.
+                for (let index = 0; index < 12; index++) {
+                    if (signal.aborted) throw signal.reason;
+                    if (
+                        !this.geminiConnection.sendAudio(
+                            Buffer.alloc(3200).toString("base64"),
+                            this.inputSampleRate,
+                        )
+                    )
+                        throw new TranslationControlError("interrupted");
+                    const next = performance.now() + 100;
+                    await waitUntil(() => performance.now() >= next, signal);
+                }
+                // A marker from an earlier segment cannot confirm the newly closed input.
+                this.drainComplete = false;
+                if (!this.geminiConnection.endAudioInput())
+                    throw new TranslationControlError("connection_unavailable");
+                const endedAt = performance.now();
+                const assertConnection = () => {
+                    if (
+                        !this.geminiConnection.isReady ||
+                        this.geminiConnection.revision !== revision ||
+                        this.drainInterrupted
+                    )
+                        throw new TranslationControlError("interrupted");
+                };
+                // The current translation model does not reliably send turnComplete. Surface
+                // settled output as unconfirmed, never as a successfully completed model turn.
+                while (true) {
+                    await waitUntil(() => {
+                        assertConnection();
+                        return (
+                            this.drainComplete ||
+                            (performance.now() - endedAt >= 5000 &&
+                                performance.now() - this.lastOutputAt >= 1500)
+                        );
+                    }, signal);
+                    const lastOutput = this.lastOutputAt;
+                    if (this.interimTimeout) clearTimeout(this.interimTimeout);
+                    this.flushInterimTranscription();
+                    await Promise.all([
+                        this.translatedAudioOutput.waitForDrain(signal),
+                        this.dataPublisher.waitForIdle(signal),
+                    ]);
+                    if (this.lastOutputAt === lastOutput) break;
+                }
+                if (!this.drainComplete) outcome = "unconfirmed";
+                assertConnection();
+                if (this.dataPublisher.getDiagnostics().droppedCaptionSegments !== captionDrops)
+                    throw new TranslationControlError("output_limit");
+            }
+            if (signal.aborted) throw signal.reason;
+            return outcome;
+        } finally {
+            clearTimeout(timeout);
+            this.drainInProgress = false;
+            this.translatedAudioOutput.endDrain();
+            if (this.organizerAudioReader instanceof BoundedAudioInput) {
+                const discarded = this.organizerAudioReader.takeBuffered();
+                this.geminiConnection.recordDroppedInput(
+                    discarded.reduce((sum, item) => sum + item.durationMs, 0),
+                );
+            }
+            if (this.operationAbort === controller) this.operationAbort = null;
+        }
     }
 
     applySettings(settings: TranslationSettingsSnapshot): void {
@@ -302,6 +438,7 @@ export class TranslationBridge {
     stop(): Promise<void> {
         if (this.stopPromise) return this.stopPromise;
         this.status = "closed";
+        this.operationAbort?.abort(new TranslationControlError("stopped"));
         this.dataPublisher.stop();
         // Defer cleanup until the shared promise is assigned, including reentrant callbacks.
         this.stopPromise = Promise.resolve().then(async () => {
@@ -461,7 +598,28 @@ export class TranslationBridge {
 
             // Handle audio response
             const serverContent = message?.serverContent;
+            if (this.operationAbort && serverContent?.interrupted) this.drainInterrupted = true;
             const parts = serverContent?.modelTurn?.parts;
+            // This model keeps emitting exact-zero PCM after audioStreamEnd. These packets
+            // are transport silence, not additional speech. Do not use a volume threshold:
+            // even quiet nonzero audio must still be delivered and extend the drain wait.
+            const audioWithSignal = new Set(
+                parts?.filter((part) =>
+                    part.inlineData?.data
+                        ? Buffer.from(part.inlineData.data, "base64").some((byte) => byte !== 0)
+                        : false,
+                ),
+            );
+            if (
+                audioWithSignal.size ||
+                parts?.some((part) => part.text) ||
+                serverContent?.outputTranscription?.text ||
+                message.outputTranscription?.text
+            ) {
+                this.lastOutputAt = performance.now();
+                this.drainComplete = false;
+            }
+            if (this.operationAbort && serverContent?.turnComplete) this.drainComplete = true;
             const modelTurnText = parts
                 ?.map((part) => part.text)
                 .filter((text): text is string => Boolean(text))
@@ -474,6 +632,7 @@ export class TranslationBridge {
             if (parts?.length) {
                 for (const part of parts) {
                     if (part.inlineData?.data) {
+                        if (this.drainInProgress && !audioWithSignal.has(part)) continue;
                         const receivedAt = performance.now();
                         this.framesReceivedFromGemini++;
                         if (
@@ -789,6 +948,13 @@ export class TranslationBridge {
             while (this.organizerAudioReader === reader && this.status !== "closed") {
                 const { done, value } = await reader.read();
                 if (done || this.organizerAudioReader !== reader || this.stopPromise) break;
+                if (!reader.consume(value)) continue;
+                if (this.operationAbort) {
+                    this.geminiConnection.recordDroppedInput(
+                        (value.samplesPerChannel / value.sampleRate) * 1000,
+                    );
+                    continue;
+                }
                 this.sendAudioToGemini(value, reader.receivedAt(value));
             }
         };

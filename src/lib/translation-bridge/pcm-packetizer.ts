@@ -22,6 +22,13 @@ export class PcmPacketizer {
         return droppedMs;
     }
 
+    flush(emit: (pcm: Buffer, receivedAt: number) => void): void {
+        const pending = this.pending;
+        const receivedAt = this.pendingAt;
+        this.pending = Buffer.alloc(0);
+        if (pending.length) emit(pending, receivedAt);
+    }
+
     push(pcm: Buffer, receivedAt: number, emit: (pcm: Buffer, receivedAt: number) => void): void {
         if (pcm.length % 2 !== 0) throw new Error("PCM must contain complete 16-bit samples");
         if (!this.pending.length) this.pendingAt = receivedAt;

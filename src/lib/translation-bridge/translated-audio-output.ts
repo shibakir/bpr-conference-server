@@ -2,6 +2,8 @@ import { AudioFrame, type AudioSource } from "@livekit/rtc-node";
 
 import { createLogger } from "../logger";
 import { AudioTempo } from "./audio-tempo";
+import { TranslationControlError } from "../translation-control";
+import { waitUntil, withOperationSignal } from "./operation-wait";
 
 const SOFT_LIMIT_RATIO = 0.7;
 const RECOVERY_TARGET_RATIO = 0.5;
@@ -52,6 +54,8 @@ export class TranslatedAudioOutput {
     private smoothNext = false;
     private generation = 0;
     private cancelCapture: (() => void) | null = null;
+    private draining = false;
+    private drainOverflow = false;
     private readonly log;
 
     constructor(private readonly options: TranslatedAudioOutputOptions) {
@@ -101,6 +105,31 @@ export class TranslatedAudioOutput {
         this.clearNativeRequested = true;
         if (!this.publishing) this.clearNative();
         this.smoothNext = true;
+        this.speed = 1;
+        this.highBacklogSince = null;
+    }
+
+    async clearAndWait(signal: AbortSignal): Promise<void> {
+        this.clear();
+        await waitUntil(() => !this.publishing && !this.clearNativeRequested, signal);
+    }
+
+    beginDrain(): void {
+        this.draining = true;
+        this.drainOverflow = false;
+    }
+    endDrain(): void {
+        this.draining = false;
+        this.trim();
+    }
+
+    async waitForDrain(signal: AbortSignal): Promise<void> {
+        await waitUntil(() => {
+            if (this.drainOverflow) throw new TranslationControlError("output_limit");
+            return !this.publishing && !this.pending.length && !this.ready.length;
+        }, signal);
+        if (this.audioSource) await withOperationSignal(this.audioSource.waitForPlayout(), signal);
+        if (this.drainOverflow) throw new TranslationControlError("output_limit");
     }
 
     private clearNativeRequested = false;
@@ -176,6 +205,10 @@ export class TranslatedAudioOutput {
     }
 
     private trim(): void {
+        if (this.draining) {
+            if (this.getTotalBacklogMs() <= 15_000) return;
+            this.drainOverflow = true;
+        }
         if (this.getTotalBacklogMs() <= this.maxBacklogMs) return;
         const targetMs = this.maxBacklogMs * RECOVERY_TARGET_RATIO;
         const processorDroppedMs =

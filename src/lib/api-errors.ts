@@ -13,6 +13,9 @@ export const API_ERROR_CODES = {
     SESSION_NOT_FOUND: "session_not_found",
     TRANSLATION_OUTPUTS_DISABLED: "translation_outputs_disabled",
     TRANSLATION_START_FAILED: "translation_start_failed",
+    TRANSLATION_INACTIVE: "translation_inactive",
+    TRANSLATION_OPERATION_CONFLICT: "translation_operation_conflict",
+    TRANSLATION_OPERATION_RATE_LIMITED: "translation_operation_rate_limited",
     UNSUPPORTED_TARGET_LANGUAGE: "unsupported_target_language",
     UNSUBSCRIBE_FAILED: "unsubscribe_failed",
 } as const;

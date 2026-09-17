@@ -10,6 +10,7 @@ function setup(capture: (frame: AudioFrame) => Promise<void>) {
         queuedDuration: 0,
         clearQueue: vi.fn(),
         close: vi.fn().mockResolvedValue(undefined),
+        waitForPlayout: vi.fn().mockResolvedValue(undefined),
     };
     const output = new TranslatedAudioOutput({
         targetLanguage: "cs",
@@ -27,6 +28,38 @@ function setup(capture: (frame: AudioFrame) => Promise<void>) {
 }
 
 describe("TranslatedAudioOutput", () => {
+    it("protects the draining tail from the normal queue cap and waits for native playout", async () => {
+        let release!: () => void;
+        let first = true;
+        const { output, source } = setup(() =>
+            first
+                ? ((first = false),
+                  new Promise<void>((r) => {
+                      release = r;
+                  }))
+                : Promise.resolve(),
+        );
+        output.beginDrain();
+        output.enqueue(Buffer.alloc(48000 * 4).toString("base64"), 0, 1);
+        expect(output.getDiagnostics().droppedOutputMs).toBe(0);
+        const waiting = output.waitForDrain(new AbortController().signal);
+        expect(source.waitForPlayout).not.toHaveBeenCalled();
+        release();
+        await waiting;
+        expect(source.waitForPlayout).toHaveBeenCalledOnce();
+        expect(output.getDiagnostics().droppedOutputMs).toBe(0);
+        output.endDrain();
+        await output.close();
+    });
+    it("reports a drain overflow rather than claiming that a dropped tail played", async () => {
+        const { output } = setup(() => new Promise(() => {}));
+        output.beginDrain();
+        output.enqueue(Buffer.alloc(48000 * 17).toString("base64"), 0, 1);
+        await expect(output.waitForDrain(new AbortController().signal)).rejects.toMatchObject({
+            code: "output_limit",
+        });
+        await output.close();
+    });
     it("caps one huge response even while native capture is blocked", async () => {
         let release!: () => void;
         const { output, source } = setup(

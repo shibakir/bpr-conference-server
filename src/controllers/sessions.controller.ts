@@ -54,6 +54,26 @@ export class SessionsController {
         return this.api.getPresenterStatus(sessionId);
     }
 
+    @Post(":sessionId/translations/:language/reset")
+    @HttpCode(202)
+    resetTranslation(
+        @Param("sessionId") sessionId: string,
+        @Param("language") language: string,
+        @Body() body: unknown,
+    ) {
+        return this.api.startTranslationAction(sessionId, language, "reset", body);
+    }
+
+    @Post(":sessionId/translations/:language/drain")
+    @HttpCode(202)
+    drainTranslation(
+        @Param("sessionId") sessionId: string,
+        @Param("language") language: string,
+        @Body() body: unknown,
+    ) {
+        return this.api.startTranslationAction(sessionId, language, "drain", body);
+    }
+
     @Post(":sessionId/presenter")
     @HttpCode(200)
     claimPresenter(@Param("sessionId") sessionId: string, @Body() body: unknown) {
